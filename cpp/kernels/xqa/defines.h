@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,6 +129,18 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define SLIDING_WINDOW 0
 #endif
 
+#ifndef SKIP_SOFTMAX_ATTN
+#define SKIP_SOFTMAX_ATTN 0
+#endif
+
+#ifndef SKIP_SOFTMAX_ATTN_BLOCK_STATS
+#define SKIP_SOFTMAX_ATTN_BLOCK_STATS 0
+#endif
+
+#ifndef SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE
+#define SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE 1
+#endif
+
 // 0 - no PDL
 // 1 - naive PDL
 // 2 - aggressive PDL (implemented only in mha_sm90.cu for now)
@@ -151,6 +163,14 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #if SPEC_DEC
 #error "SPEC_DEC is not supported for USE_INPUT_KV"
 #endif
+#endif
+
+// Number of head elements RoPE is applied to (rotary_embedding_dim). Defaults to the full head
+// (HEAD_ELEMS) for full rotary; set smaller for partial rotary (partial_rotary_factor < 1). The
+// trailing [ROPE_ELEMS, HEAD_ELEMS) elements are passed through unrotated. Defined unconditionally
+// so validRopeElemsPerHead is well-formed even for kernels that do not apply RoPE in-kernel.
+#ifndef ROPE_ELEMS
+#define ROPE_ELEMS HEAD_ELEMS
 #endif
 
 // Output element type:

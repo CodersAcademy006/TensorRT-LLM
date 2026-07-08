@@ -56,24 +56,23 @@ def compute_target_rank_id(expert_id, num_experts_per_rank):
     return expert_id // num_experts_per_rank
 
 
-def generate_token_selected_experts(local_num_tokens: int, ep_size: int,
-                                    num_experts_per_rank: int,
+def generate_token_selected_experts(local_num_tokens: int, num_experts: int,
                                     top_k: int) -> torch.Tensor:
     """Generate global expert IDs tensor, aligned with single-GPU test semantics."""
     return torch.randint(
         0,
-        ep_size * num_experts_per_rank,
+        num_experts,
         (local_num_tokens, top_k),
         dtype=torch.int32,
         device='cuda',
     )
 
 
-def create_experts(num_experts_per_rank,
-                   hidden_size,
-                   ep_rank,
-                   device,
-                   dtype=torch.bfloat16):
+def create_experts_per_rank(num_experts_per_rank,
+                            hidden_size,
+                            ep_rank,
+                            device,
+                            dtype=torch.bfloat16):
     """
     Create a 3D tensor of expert weights for a given rank.
 
@@ -226,9 +225,9 @@ def make_bfloat16_payloads(
 
 
 def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
-                                     workspace_size_per_rank,
-                                     num_experts_per_rank, hidden_size,
-                                     invalid_token_expert_id):
+                                     workspace_size_per_rank, num_experts,
+                                     hidden_size, invalid_token_expert_id,
+                                     enable_eplb):
     """Worker function for MPIPoolExecutor."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -244,25 +243,40 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         # Create MoeAlltoAll manager
         max_num_tokens = max(all_num_tokens)
 
-        moe_a2a = MoeAlltoAll(mapping, max_num_tokens, top_k,
-                              ep_size * num_experts_per_rank,
-                              workspace_size_per_rank)
+        eplb_stats_num_experts = (
+            num_experts // 2 if enable_eplb else None
+        )  # Use half of the experts for testing EPLB stats
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_slots=num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+            num_experts=eplb_stats_num_experts,
+        )
 
         # Get the number of tokens for this specific rank (same as single-GPU)
         rank_local_tokens = all_num_tokens[rank]
 
         # Generate data using helper functions
         token_selected_experts = generate_token_selected_experts(
-            rank_local_tokens, ep_size, num_experts_per_rank, top_k)
+            rank_local_tokens, num_experts, top_k)
         payloads, expert_id_payload_index = make_nvfp4_payloads(
             rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
+
+        eplb_local_stats = None
+        if enable_eplb:
+            eplb_local_stats = (torch.arange(
+                eplb_stats_num_experts, dtype=torch.int32, device="cuda") +
+                                rank * 1000)
 
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts,
             payloads,
             max_num_tokens,
             invalid_token_expert_id=invalid_token_expert_id,
-            expert_id_payload_index=expert_id_payload_index)
+            expert_id_payload_index=expert_id_payload_index,
+            eplb_local_stats=eplb_local_stats)
 
         # Verify completion flags after dispatch
         completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
@@ -306,10 +320,16 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                 max_num_tokens, top_k).cpu()
 
         # Return results to be collected (move to CPU for MPI transfer)
+        eplb_gathered_stats = moe_a2a._state.eplb_gathered_stats
+        if eplb_gathered_stats is not None:
+            eplb_gathered_stats = eplb_gathered_stats.cpu()
+        if eplb_local_stats is not None:
+            eplb_local_stats = eplb_local_stats.cpu()
+
         return (token_selected_experts.cpu(), [p.cpu() for p in payloads],
-                [rt.cpu()
-                 for rt in recv_tensors], send_counters, topk_send_indices,
-                topk_target_ranks, recv_counters, expert_id_payload_index)
+                [rt.cpu() for rt in recv_tensors], send_counters,
+                topk_send_indices, topk_target_ranks, recv_counters,
+                expert_id_payload_index, eplb_local_stats, eplb_gathered_stats)
     except Exception:
         traceback.print_exc()
         raise
@@ -318,11 +338,12 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_tensors,
                     all_send_counters, all_topk_send_indices,
                     all_topk_target_ranks, all_recv_counters, ep_size,
-                    all_num_tokens, top_k, num_experts_per_rank,
-                    expert_id_payload_index, invalid_token_expert_id):
+                    all_num_tokens, top_k, num_experts, expert_id_payload_index,
+                    invalid_token_expert_id):
     """Verify dispatch results including actual content verification"""
 
     max_num_tokens = max(all_num_tokens)
+    num_experts_per_rank = num_experts // ep_size
     # Verify dimensions and dtypes
     for send_rank in range(ep_size):
         local_num_tokens = all_num_tokens[send_rank]
@@ -475,26 +496,32 @@ class TestMoEAlltoAll:
         enabled=False
     )  # MPI pool executors have known thread cleanup timing issues
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k",
+        "mpi_pool_executor,all_num_tokens,top_k,enable_eplb",
         [
             # (num_workers, all_num_tokens, top_k)
             # Basic configurations
-            (4, [32, 32, 32, 32], 2),  # Four ranks with uniform distribution
+            (4, [32, 32, 32, 32], 2, False
+             ),  # Four ranks with uniform distribution
             (4, [16, 32, 64, 48
-                 ], 2),  # Four ranks with non-uniform distribution
-            (2, [100, 50], 2),  # Two ranks with different loads
+                 ], 2, False),  # Four ranks with non-uniform distribution
+            (2, [100, 50], 2, False),  # Two ranks with different loads
             (8, [10, 20, 30, 40, 50, 60, 70, 80
-                 ], 2),  # Eight ranks with increasing load
+                 ], 2, False),  # Eight ranks with increasing load
 
             # Different top_k values
-            (4, [32, 32, 32, 32], 4),  # Four ranks with top_k = 4
-            (4, [32, 32, 32, 32], 8),  # Four ranks with top_k = 8
+            (4, [32, 32, 32, 32], 4, False),  # Four ranks with top_k = 4
+            (4, [32, 32, 32, 32], 8, False),  # Four ranks with top_k = 8
 
             # Edge cases
-            (4, [1, 1, 1, 1], 2),  # Four ranks with single token per rank
+            (4, [1, 1, 1, 1], 2, False
+             ),  # Four ranks with single token per rank
+
+            # EPLB stats path
+            (4, [32, 32, 32, 32], 2, True),
         ],
         indirect=["mpi_pool_executor"])
-    def test_dispatch(self, mpi_pool_executor, all_num_tokens, top_k):
+    def test_dispatch(self, mpi_pool_executor, all_num_tokens, top_k,
+                      enable_eplb):
         """Test MoE A2A dispatch with MNNVL across multiple GPUs"""
 
         try:
@@ -511,7 +538,7 @@ class TestMoEAlltoAll:
         ) >= ep_size, f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}"
 
         hidden_size = 1024
-        num_experts_per_rank = 8
+        num_experts = 32
 
         # Large enough workspace
         workspace_size_per_rank = 512 * 1024 * 1024
@@ -523,8 +550,8 @@ class TestMoEAlltoAll:
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
-                    num_experts_per_rank, hidden_size,
-                    invalid_token_expert_id)] * ep_size),
+                    num_experts, hidden_size, invalid_token_expert_id,
+                    enable_eplb)] * ep_size),
         )
 
         # Collect results from all ranks (same as single-GPU collecting from emulated ranks)
@@ -540,6 +567,8 @@ class TestMoEAlltoAll:
         all_recv_counters = [r[6] for r in all_results]
         all_expert_id_payload_index = [r[7] for r in all_results]
         expert_id_payload_index = all_expert_id_payload_index[0]
+        all_eplb_local_stats = [r[8] for r in all_results]
+        all_eplb_gathered_stats = [r[9] for r in all_results]
 
         assert all(i == expert_id_payload_index
                    for i in all_expert_id_payload_index
@@ -550,27 +579,57 @@ class TestMoEAlltoAll:
                         all_recv_tensors, all_send_counters,
                         all_topk_send_indices, all_topk_target_ranks,
                         all_recv_counters, ep_size, all_num_tokens, top_k,
-                        num_experts_per_rank, expert_id_payload_index,
+                        num_experts, expert_id_payload_index,
                         invalid_token_expert_id)
 
-    @pytest.mark.skipif(torch.cuda.device_count() < 8,
-                        reason='needs at least 8 GPUs to run multi-GPU test')
+        if enable_eplb:
+            expected_stats = torch.stack(all_eplb_local_stats, dim=0)
+            for rank in range(ep_size):
+                gathered_stats = all_eplb_gathered_stats[rank]
+                assert gathered_stats is not None
+                assert torch.equal(
+                    gathered_stats,
+                    expected_stats), (f"Rank {rank} gathered_stats mismatch")
+
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k",
+        "mpi_pool_executor,all_num_tokens,top_k,payload_in_workspace,use_fp8_combine",
         [
-            # (num_workers, all_num_tokens, top_k)
-            (4, [32, 32, 32, 32], 2),
-            (4, [16, 32, 64, 48], 2),
-            (2, [100, 50], 2),
-            (4, [32, 32, 32, 32], 4),
-            (4, [1, 1, 1, 1], 2),
-            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
+            # (num_workers, all_num_tokens, top_k, payload_in_workspace, use_fp8_combine)
+            (4, [32, 32, 32, 32], 2, False, False),
+            (4, [16, 32, 64, 48], 2, False, False),
+            (2, [100, 50], 2, False, False),
+            (4, [32, 32, 32, 32], 4, False, False),
+            (4, [32, 32, 32, 32
+                 ], 10, False, False),  # top_k=10 used by Qwen3-next
+            (4, [1, 1, 1, 1], 2, False, False),
+            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4, False, False),
+            (4, [32, 0, 16, 0], 2, False, False),
+            # payload_in_workspace=True
+            (4, [32, 32, 32, 32], 4, True, False),
+            (4, [32, 0, 16, 0], 4, True, False),
+            (4, [16, 32, 64, 48], 4, True, False),  # non-uniform tokens
+            (4, [32, 32, 32, 32], 10, True, False),
+            # use_fp8_combine=True: staged quantization (external payload)
+            (4, [32, 32, 32, 32], 4, False, True),
+            (4, [32, 0, 16, 0], 4, False, True),
+            (4, [16, 32, 64, 48], 4, False, True),  # non-uniform tokens
+            (4, [32, 32, 32, 32], 10, False, True),
+            # use_fp8_combine=True, payload_in_workspace=True: in-place quantization
+            (4, [32, 32, 32, 32], 4, True, True),
+            (4, [32, 0, 16, 0], 4, True, True),
+            (4, [16, 32, 64, 48], 4, True, True),  # non-uniform tokens
+            (4, [32, 32, 32, 32], 10, True, True),
         ],
         indirect=["mpi_pool_executor"])
-    def test_combine(self, mpi_pool_executor, all_num_tokens, top_k):
-        """Test MoE A2A combine with MNNVL across multiple GPUs"""
+    def test_combine(self, mpi_pool_executor, all_num_tokens, top_k,
+                     payload_in_workspace, use_fp8_combine):
+        """Test MoE A2A combine with MNNVL across multiple GPUs.
 
+        When use_fp8_combine=True, runs two back-to-back rounds (BF16 reference then FP8)
+        and compares within FP8 rounding tolerance. When False, verifies against a
+        ground-truth fake-MoE computation.
+        """
         try:
             MnnvlMemory.initialize()
             assert MnnvlMemory.supports_mnnvl()
@@ -578,56 +637,61 @@ class TestMoEAlltoAll:
             pytest.skip("MNNVL not supported on this system")
 
         ep_size = mpi_pool_executor.num_workers
+        if ep_size > torch.cuda.device_count():
+            pytest.skip(
+                f"Need at least {ep_size} GPUs to run this test, but only {torch.cuda.device_count()} are available"
+            )
         assert ep_size == len(
             all_num_tokens), "ep_size does not match all_num_tokens"
 
-        assert torch.cuda.device_count(
-        ) >= ep_size, f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}"
-
-        hidden_size = 2880  # gpt-oss
-        num_experts_per_rank = 8
+        # gpt-oss-20b
+        hidden_size = 2880
+        num_experts = 32
 
         # Large enough workspace
         workspace_size_per_rank = 512 * 1024 * 1024
 
-        # Run dispatch and combine on workers
-        print("Starting dispatch and combine on workers...")
         invalid_token_expert_id = -1
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_moe_combine_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
-                    num_experts_per_rank, hidden_size,
-                    invalid_token_expert_id)] * ep_size),
+                    num_experts, hidden_size, invalid_token_expert_id,
+                    payload_in_workspace, use_fp8_combine)] * ep_size),
         )
 
-        # Collect results
-        print("Collecting results from workers...")
         try:
             all_results = list(results)
-            print(
-                f"Successfully collected results from {len(all_results)} workers"
-            )
-        except Exception as e:
-            print(f"Error collecting results: {e}")
+        except Exception:
             traceback.print_exc()
             raise
 
-        # Verify combine results
-        print("Starting verification...")
-        verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
-                               hidden_size, num_experts_per_rank)
+        if use_fp8_combine:
+            verify_combine(all_results, ep_size, rtol=0.13, atol=1.0)
+        else:
+            verify_combine(all_results, ep_size, rtol=0.1, atol=0.5)
 
 
-def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
-                                                 workspace_size_per_rank,
-                                                 num_experts_per_rank,
-                                                 hidden_size,
-                                                 invalid_token_expert_id):
-    """Worker function for dispatch and combine test."""
+def run_moe_a2a_dispatch_moe_combine_single_rank(
+        ep_size,
+        all_num_tokens,
+        top_k,
+        workspace_size_per_rank,
+        num_experts,
+        hidden_size,
+        invalid_token_expert_id,
+        payload_in_workspace=False,
+        use_low_precision_combine=False):
+    """Worker function for dispatch and combine test.
+
+    Runs one dispatch+combine round and returns
+    (token_selected_experts, payloads, combined_output, rank_experts) for
+    ground-truth verification via verify_combine.
+    """
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     device = torch.cuda.current_device()
     max_num_tokens = max(all_num_tokens)
+    rank_local_tokens = all_num_tokens[rank]
 
     try:
         mapping = Mapping(rank=rank,
@@ -635,68 +699,72 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                           moe_ep_size=ep_size,
                           world_size=ep_size)
 
-        # Create MoeAlltoAll manager
-        moe_a2a = MoeAlltoAll(mapping, max_num_tokens, top_k,
-                              ep_size * num_experts_per_rank,
-                              workspace_size_per_rank)
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_slots=num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+        )
 
-        rank_local_tokens = all_num_tokens[rank]
-
-        # Generate test data - use simpler payload for combine test
         token_selected_experts = generate_token_selected_experts(
-            rank_local_tokens, ep_size, num_experts_per_rank, top_k)
-
+            rank_local_tokens, num_experts, top_k)
         payloads, expert_id_payload_index = make_bfloat16_payloads(
             rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
 
-        # Run dispatch
-        with torch.cuda.profiler.profile():
+        num_experts_per_rank = num_experts // ep_size
+        rank_experts = create_experts_per_rank(num_experts_per_rank,
+                                               hidden_size,
+                                               rank,
+                                               device,
+                                               dtype=torch.bfloat16)
+
+        def dispatch_and_fake_moe():
+            """Run one dispatch round and return fake-MoE output [ep_size, max_tokens, hidden]."""
             recv_tensors = moe_a2a.dispatch(
                 token_selected_experts,
                 payloads,
                 max_num_tokens,
                 invalid_token_expert_id=invalid_token_expert_id,
                 expert_id_payload_index=expert_id_payload_index)
+            hs, tse, tfs = recv_tensors[0], recv_tensors[1], recv_tensors[2]
+            moe_out = fake_moe(
+                hs.view(ep_size * max_num_tokens, hs.shape[-1]),
+                tse.view(ep_size * max_num_tokens, tse.shape[-1]),
+                tfs.view(ep_size * max_num_tokens, tfs.shape[-1]),
+                rank_experts,
+                is_ep=True,
+                ep_rank=rank,
+                num_experts_per_rank=num_experts_per_rank,
+            )
+            return moe_out.view(ep_size, max_num_tokens, hs.shape[-1])
 
-        hidden_states_recv = recv_tensors[
-            0]  # [ep_size, max_num_tokens, hidden_size]
-        token_selected_experts_recv = recv_tensors[
-            1]  # [ep_size, max_num_tokens, top_k]
-        token_final_scales_recv = recv_tensors[
-            2]  # [ep_size, max_num_tokens, top_k]
+        def _combine(moe_out, use_low_precision):
+            """Call combine, optionally staging moe_out via workspace buffer."""
+            if payload_in_workspace:
+                ws = moe_a2a.get_combine_payload_tensor_in_workspace(
+                    max_num_tokens, hidden_size, torch.bfloat16)
+                ws.copy_(moe_out.view(-1, hidden_size))
+                return moe_a2a.combine(
+                    ws.view(ep_size, max_num_tokens, hidden_size),
+                    max_num_tokens,
+                    payload_in_workspace=True,
+                    use_low_precision_combine=use_low_precision,
+                )
+            return moe_a2a.combine(moe_out,
+                                   max_num_tokens,
+                                   use_low_precision_combine=use_low_precision)
 
-        # emulate MoE computation on the received data
-        # Create experts for this rank
-        rank_experts = create_experts(num_experts_per_rank,
-                                      hidden_size,
-                                      rank,
-                                      device,
-                                      dtype=torch.bfloat16)
-
-        hidden_states_recv = fake_moe(
-            hidden_states_recv.view(ep_size * max_num_tokens,
-                                    hidden_states_recv.shape[-1]),
-            token_selected_experts_recv.view(
-                ep_size * max_num_tokens,
-                token_selected_experts_recv.shape[-1]),
-            token_final_scales_recv.view(ep_size * max_num_tokens,
-                                         token_final_scales_recv.shape[-1]),
-            rank_experts,  # experts for current rank
-            is_ep=True,
-            ep_rank=rank,
-            num_experts_per_rank=num_experts_per_rank).view(
-                ep_size, max_num_tokens, hidden_states_recv.shape[-1])
-
-        with torch.cuda.profiler.profile():
-            combined_output = moe_a2a.combine(hidden_states_recv,
-                                              max_num_tokens)
+        moe_out = dispatch_and_fake_moe()
+        combined_output = _combine(moe_out,
+                                   use_low_precision=use_low_precision_combine)
 
         # Verify completion flags after combine
         completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
             "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags_ptr = moe_a2a.workspace[
-            rank, completion_flags_offset:completion_flags_offset + ep_size * 4]
-        completion_flags = completion_flags_ptr.view(torch.int32).cpu()
+        completion_flags = moe_a2a.workspace[
+            rank, completion_flags_offset:completion_flags_offset +
+            ep_size * 4].view(torch.int32).cpu()
         flag_val_offset = moe_a2a.metainfo[
             MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
         expected_flag_val = moe_a2a.workspace[rank,
@@ -706,20 +774,18 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
         )
 
-        # Return results for verification
         return (
             token_selected_experts.cpu(),
-            [p.cpu() for p in payloads],  # Return actual payloads used
+            [p.cpu() for p in payloads],
             combined_output.cpu(),
-            rank_experts.cpu()  # Return the experts used on this rank
+            rank_experts.cpu(),
         )
     except Exception:
         traceback.print_exc()
         raise
 
 
-def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
-                           hidden_size, num_experts_per_rank):
+def verify_combine(all_results, ep_size, rtol, atol):
     """Verify that combine correctly sums the dispatched tokens."""
 
     # Extract results
@@ -755,15 +821,15 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
         try:
             torch.testing.assert_close(combined_output,
                                        expected_combined_output,
-                                       rtol=1e-1,
-                                       atol=5e-1)
+                                       rtol=rtol,
+                                       atol=atol)
         except AssertionError as e:
             # Find the first mismatch location
             abs_diff = (combined_output - expected_combined_output).abs()
             rel_diff = abs_diff / (expected_combined_output.abs() + 1e-8)
 
             # Check both absolute and relative tolerance
-            mask = (abs_diff > 5e-1) & (rel_diff > 1e-1)
+            mask = (abs_diff > atol) & (rel_diff > rtol)
             if mask.any():
                 # Get the first mismatch
                 mismatch_indices = torch.nonzero(mask)[0].tolist()

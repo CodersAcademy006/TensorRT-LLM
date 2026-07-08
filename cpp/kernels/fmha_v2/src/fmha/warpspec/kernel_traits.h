@@ -51,8 +51,9 @@ template <
     int NUM_COMPUTE_GROUPS_,
     // The number of data warpgroups (TMA).
     int DMA2COMPUTE_DEPTH_,
-    // The attention mask type: padding (0), causal (1), sliding_window_causal (2), custom_mask (3).
-    // See fused_multihead_attention_kernel.h for description.
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+    // bidirectional_sliding_window_attention (3), custom_mask (4). See fused_multihead_attention_kernel.h for
+    // description.
     int ATTENTION_MASK_TYPE_ = 0,
     // Is head interleaved ?
     // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
@@ -71,6 +72,8 @@ template <
     bool ENABLE_BMM1_SOFTCAPPING_SCALE_ = false,
     // Save softmax stats ?
     bool RETURN_SOFTMAX_STATS_ = false,
+    // Enable skip softmax attention feature
+    bool ENABLE_SKIP_SOFTMAX_ = false,
     // The output type (only used by fp8 kernels).
     typename OutputType = typename Instruction_traits<STEP_Q_, STEP_KV_, 0, false, false>::A_type,
     // The sage attention block size for Q, K and V
@@ -248,7 +251,8 @@ struct Kernel_traits
         WARP_GROUP_K = 1
     };
 
-    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2), custom_mask (3).
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+    // bidirectional_sliding_window_attention (3), custom_mask (4).
     enum
     {
         CAUSAL_MASK = (ATTENTION_MASK_TYPE_ == 1 || ATTENTION_MASK_TYPE_ == 2)
@@ -256,7 +260,12 @@ struct Kernel_traits
 
     enum
     {
-        SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2
+        SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2 || ATTENTION_MASK_TYPE_ == 3
+    };
+
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = ATTENTION_MASK_TYPE_ == 3
     };
 
     // Is head interleaved ?
@@ -284,10 +293,16 @@ struct Kernel_traits
         ENABLE_BMM1_SOFTCAPPING_SCALE = ENABLE_BMM1_SOFTCAPPING_SCALE_
     };
 
-    // Use the custom mask input ( attention_mask_type == 3.)
+    // Use the custom mask input ( attention_mask_type == 4.)
     enum
     {
-        USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 3
+        USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 4
+    };
+
+    // Are we enabling skip softmax attention feature?
+    enum
+    {
+        ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_
     };
 
     static_assert(!USE_CUSTOM_MASK || STEP_KV == 64 || STEP_KV == 128 || STEP_KV == 256, "Not implemented!");
@@ -384,6 +399,8 @@ struct Kernel_traits
     // Named barrier ids
     static constexpr int DMA_SYNC_BARRIER_ID = 0x1;
     static constexpr int MMA_SYNC_BARRIER_ID = 0x2;
+    // There are 2 warpgroups so 0x3 and 0x4 are used for skip-softmax
+    static constexpr int SKIP_SOFTMAX_BARRIER_ID = 0x3;
 
     // How many threads get involved in the dma group.
     enum
@@ -518,6 +535,10 @@ struct Kernel_traits
         // Mutex
         OrderedMutex compute_mutex;
 
+        // 4 warps in a warpgroup vote to an atomic variable in shared memory
+        // to decide whether to skip this STEP_KV. Double-buffered to avoid races between consecutive KV_STEPS.
+        uint32_t skip_softmax_votes[2][NUM_COMPUTE_GROUPS];
+
         inline __device__ void init(int tid0)
         {
 
@@ -580,6 +601,8 @@ template < // The step size in query sequence dimension (M of BMM1 and BMM2).
     bool ENABLE_BMM1_SOFTCAPPING_SCALE_ = false,
     // Save softmax stats ?
     bool RETURN_SOFTMAX_STATS_ = false,
+    // Enable skip softmax attention feature
+    bool ENABLE_SKIP_SOFTMAX_ = false,
     // The output type (only used by fp8 kernels).
     typename OutputType = e4m3_t,
     // The sage attention block size for Q, K and V
@@ -588,14 +611,15 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
     : public Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
           NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_,
           ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_,
-          RETURN_SOFTMAX_STATS_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>
+          RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_,
+          SAGE_BLOCK_SIZE_V_>
 {
 
     // Base class.
     using Base = Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
         NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_,
         SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_,
-        OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
+        ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
 
     enum
     {
@@ -692,6 +716,10 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
 
         // Mutex
         OrderedMutex compute_mutex;
+
+        // 4 warps in a warpgroup vote to an atomic variable in shared memory
+        // to decide whether to skip this STEP_KV. Double-buffered to avoid races between consecutive STEP_KVs.
+        uint32_t skip_softmax_votes[2][Base::NUM_COMPUTE_GROUPS];
 
         inline __device__ void init(int tid0)
         {

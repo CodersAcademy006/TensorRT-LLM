@@ -16,14 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda.h>
 #include <vector>
 
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -40,19 +41,47 @@ enum class ActType
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
     //
     // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
-    SwiGlu
+    SwiGlu,
+    Relu2,
+    Silu
+};
+
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType
+{
+    None = 0,
+    // Gelu is defined as the following operation:
+    // act = x0 * phi(x0)
+    // where x0 is the output of the Gemm
+    // phi is the CDF of standard normal distribution approximated by
+    // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    Gelu,
+    // Relu2 (also known as squared Relu) is defined as the following operation:
+    // act = relu(x0) ^ 2
+    // where x0 is the output of the Gemm.
+    Relu2,
+    // Silu is defined as the following operation:
+    // act = x0 * sigmoid(x0)
+    // where x0 is the output of the Gemm.
+    Silu
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions
 {
+    // Canonically, A is activation.
     batchedGemm::trtllm::gen::Dtype dtypeA;
+    // Canonically, B is weight.
     batchedGemm::trtllm::gen::Dtype dtypeB;
+    // C is output.
     batchedGemm::trtllm::gen::Dtype dtypeC;
     ActType actType{ActType::SwiGlu};
+    EltwiseActType eltwiseActType{EltwiseActType::None};
     bool deepSeekFp8{false};
     bool fusedAct{false};
     bool routeAct{false};
     bool staticBatch{false};
+    // Legacy: force transpose-only kernels. Used by fp8BatchedGemmTrtllmGen.
+    // MoE callers leave false (auto-selects transpose or non-transpose).
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
@@ -126,4 +155,5 @@ private:
     std::vector<int64_t> mPassingConfigIndices;
 };
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

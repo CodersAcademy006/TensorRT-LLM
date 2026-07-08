@@ -21,10 +21,12 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
 #include <cstdint>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <array>
 #include <cuda_runtime_api.h>
@@ -33,7 +35,9 @@
 #include <random>
 #include <utility>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 // Change to following declarations must sync with lora.h in public repo
 class LoraImpl;
@@ -64,6 +68,14 @@ struct LoraParams
     void* workspace;
 
     cudaEvent_t* memcpy_event_ptr;
+
+    // Device-side capture-safe LoRA path scratch. When device_path.enabled is
+    // true, the kernel uses launchMoeLoraPointerExpand, launchMoeLoraProblemBuilder,
+    // and cudaGraph(SplitK)GroupedGemm instead of the legacy host-pointer
+    // LoraImpl::run path. The pointers refer to persistent allocations owned by
+    // the calling FusedMoeRunner, so their addresses are stable across
+    // CUDA-graph captures and replays.
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePath device_path;
 
     LoraParams() = default;
 
@@ -305,6 +317,17 @@ struct QuantParams
 
         GemmInputs fc1;
         GemmInputs fc2;
+
+        // Dynamic fc2 input scale: compute fc2 input scale from intermediate activation at runtime.
+        // Only used when enabled = true; all pointers are nullptr otherwise.
+        struct DynamicFc2InputScale
+        {
+            bool enabled = false;
+            float* amax = nullptr;                 // [1] global amax output
+            float* alpha = nullptr;                // [num_experts] dynamic alpha output
+            void* bf16_buffer = nullptr;           // bf16 intermediate buffer
+            float const* weight_scale_2 = nullptr; // [num_experts] per-expert weight_scale_2 for fc2
+        } dynamic_fc2_input_scale;
     } fp4;
 
     // GPTQ/AWQ quantization params
@@ -312,7 +335,8 @@ struct QuantParams
     {
         struct GroupwiseGemmInputs
         {
-            void const* act_scales = nullptr;
+            bool use_per_expert_act_scale = false;
+            void const* act_scales = nullptr; // (1 or num_experts_per_node, hidden_size or intermediate_size)
             void const* weight_scales = nullptr;
             void const* weight_zeros = nullptr;
             float const* alpha = nullptr;
@@ -398,12 +422,15 @@ struct QuantParams
     static QuantParams GroupWise(int group_size, void const* fc1_weight_scales, void const* fc2_weight_scales,
         void const* fc1_activation_scales = nullptr, void const* fc2_activation_scales = nullptr,
         void const* fc1_weight_zeros = nullptr, void const* fc2_weight_zeros = nullptr,
-        float const* fc1_alpha = nullptr, float const* fc2_alpha = nullptr)
+        float const* fc1_alpha = nullptr, float const* fc2_alpha = nullptr, bool fc1_use_per_expert_act_scale = false,
+        bool fc2_use_per_expert_act_scale = false)
     {
         QuantParams qp;
         qp.groupwise.group_size = group_size;
-        qp.groupwise.fc1 = {fc1_activation_scales, fc1_weight_scales, fc1_weight_zeros, fc1_alpha};
-        qp.groupwise.fc2 = {fc2_activation_scales, fc2_weight_scales, fc2_weight_zeros, fc2_alpha};
+        qp.groupwise.fc1
+            = {fc1_use_per_expert_act_scale, fc1_activation_scales, fc1_weight_scales, fc1_weight_zeros, fc1_alpha};
+        qp.groupwise.fc2
+            = {fc2_use_per_expert_act_scale, fc2_activation_scales, fc2_weight_scales, fc2_weight_zeros, fc2_alpha};
         return qp;
     }
 
@@ -643,7 +670,7 @@ public:
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array, bool bias_is_broadcast,
         cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-        int* num_active_experts_per, int* active_expert_global_ids);
+        int* num_active_experts_per, int* active_expert_global_ids, void const* fc2_prequant_scale = nullptr);
 
     static void gemm2(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
         DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, void* const gemm_output,
@@ -800,6 +827,16 @@ private:
         bool min_latency_mode, bool use_awq);
 
 private:
+    static bool useAwq(cutlass_kernels::QuantParams const& quant_params)
+    {
+        return quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales && !use_wfp4a16;
+    }
+
+    static bool usePrequantScaleKernel(cutlass_kernels::QuantParams const& quant_params)
+    {
+        return useAwq(quant_params) && !std::is_same_v<T, WeightType>;
+    }
+
     bool mayHaveDifferentGEMMOutputType() const
     {
         // We just check if its supported because we need to know when calculating workspace size
@@ -810,13 +847,13 @@ private:
     bool mayHaveFinalizeFused() const
     {
         return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() >= 90 && use_fused_finalize_
-            && !use_w4_groupwise;
+            && !use_wfp4a16;
     }
 
     static bool mayHaveFinalizeFused(int sm)
     {
         using RunnerType = decltype(moe_gemm_runner_);
-        return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_w4_groupwise;
+        return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_wfp4a16;
     }
 
     // TODO: This should eventually take the quant params to give more flexibility
@@ -863,7 +900,8 @@ private:
 
     T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
         int64_t const* num_valid_tokens_ptr, int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq,
-        cudaStream_t stream, int64_t* expert_first_token_offset = nullptr, int const num_experts_per_node = 0);
+        cudaStream_t stream, QuantParams const& quant_params, int64_t* expert_first_token_offset = nullptr,
+        int const num_experts_per_node = 0);
 
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
     std::unique_ptr<DeepSeekBlockScaleGemmRunner> blockscale_gemm_runner_;
@@ -1016,4 +1054,6 @@ private:
 void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 } // namespace cutlass_kernels
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

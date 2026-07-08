@@ -5,6 +5,8 @@ import torch
 from torch.fx import Node
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
+
 
 def get_symint_val(i: Union[torch.SymInt | int]):
     if isinstance(i, int):
@@ -60,14 +62,31 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
+        torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
+            1: "out",
+            2: "residual"
+        },
         torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
+            2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
             1: "output"
         },
+        torch.ops.trtllm.mla_dsa_attn_inplace.default: {
+            1: "output"
+        },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
+        },
+        torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
+            1: "qkv"
+        },
+        torch.ops.trtllm.fused_dit_split_norm_rope.default: {
+            1: "tensor"
+        },
+        torch.ops.trtllm.fused_dit_split_norm.default: {
+            1: "tensor"
         },
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
         {
@@ -77,18 +96,40 @@ def inplace_info():
         torch.ops.trtllm.logits_bitmask.default: {
             1: "logits"
         },
+        torch.ops.trtllm.moe_unpermute_inplace.default: {
+            1: "output"
+        },
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {
-            6: "output"
+            1: "output"
         },
         torch.ops.trtllm.pp_recv_tensors.default: {
             1: "tensors"
         },
         torch.ops.trtllm.pp_send_tensors.default: {
             1: "tensors"
+        },
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
+            1: "output"
+        },
+        torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell.default: {
+            1: "output"
+        },
+        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell.default: {
+            1: "output"
+        },
+        torch.ops.trtllm.inplace_slice_copy.default: {
+            1: "dest"
         }
     }
+    if IS_CUDA_TILE_AVAILABLE:
+        # cuda.tile availability depends on GPU capability thus runtime check.
+        inplace_map[
+            torch.ops.trtllm.cuda_tile_rms_norm_fuse_residual_.default] = {
+                1: "x",
+                2: "residual"
+            }
     return inplace_map

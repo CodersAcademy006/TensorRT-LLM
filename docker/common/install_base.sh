@@ -8,6 +8,21 @@ if [ -n "${GITHUB_MIRROR}" ]; then
     export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
+if [ -n "${GITHUB_MIRROR}" ]; then
+  BOOST_URL="https://urm.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
+else
+  BOOST_URL="https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz"
+fi
+
+install_boost() {
+  # Install boost version >= 1.78 for boost::span
+  # Current libboost-dev apt packages are < 1.78, so install from tar.gz
+  wget --no-verbose --retry-connrefused --timeout=180 --tries=10 --continue -O /tmp/boost.tar.gz ${BOOST_URL} \
+    && tar xzf /tmp/boost.tar.gz -C /tmp \
+    && mv /tmp/boost_1_80_0/boost /usr/include/boost \
+    && rm -rf /tmp/boost_1_80_0 /tmp/boost.tar.gz
+}
+
 set_bash_env() {
   if [ ! -f ${BASH_ENV} ];then
     touch ${BASH_ENV}
@@ -21,11 +36,21 @@ set_bash_env() {
 }
 
 cleanup() {
-  # Clean up apt/dnf cache
+  # Clean up apt/dnf cache.
+  # NOTE: When this script runs under a BuildKit RUN with cache mounts on
+  # /var/cache/apt and /var/lib/apt (see docker/Dockerfile.multi), `apt-get
+  # clean` and `rm -rf /var/lib/apt/lists/*` operate on the persistent cache
+  # mount rather than the image layer, so they would wipe the cache between
+  # builds. The mount itself ensures these paths are not baked into the
+  # layer, so skipping the apt cleanup here keeps the image size unchanged
+  # while preserving the cache for incremental rebuilds.
   if [ -f /etc/debian_version ]; then
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
+    echo "Removing python3-pygments from Ubuntu..."
+    apt-get remove -y python3-pygments || true
+    apt-get autoremove -y || true
   elif [ -f /etc/redhat-release ]; then
+    echo "Removing python3-pygments from Rocky Linux..."
+    dnf remove -y python3-pygments || true
     dnf clean all
     rm -rf /var/cache/dnf
   fi
@@ -33,8 +58,9 @@ cleanup() {
   # Clean up temporary files
   rm -rf /tmp/* /var/tmp/*
 
-  # Clean up pip cache
-  pip3 cache purge || true
+  # pip's wheel cache lives at /root/.cache/pip, which is also a BuildKit
+  # cache mount in the devel stage. `pip3 cache purge` would empty that
+  # mount; rely on the mount lifecycle instead.
 
   # Clean up documentation
   rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*
@@ -49,14 +75,17 @@ init_ubuntu() {
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
+    libtool \
+    autoconf \
+    automake \
     ccache \
     gdb \
     git-lfs \
     clang \
+    graphviz \
     lld \
     llvm \
     libclang-rt-dev \
-    libffi-dev \
     libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
@@ -69,6 +98,12 @@ init_ubuntu() {
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
+
+  # PEP 668: Allow break system packages for ubuntu24.04,
+  # and ubuntu22.04 (currently not used) shouldn't be affected.
+  pip3 config set global.break-system-packages true
+  pip3 install --ignore-installed pip setuptools wheel
+
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
@@ -119,7 +154,7 @@ install_python_rockylinux() {
 }
 
 install_pyp_rockylinux() {
-  bash -c "pip3 install 'urllib3<2.0' pytest"
+  bash -c "pip3 install pytest"
 }
 
 install_gcctoolset_rockylinux() {
@@ -132,7 +167,6 @@ install_gcctoolset_rockylinux() {
     wget \
     git-lfs \
     gcc-toolset-11 \
-    libffi-devel \
     -y
   dnf install \
     openmpi \
@@ -151,11 +185,13 @@ set_bash_env
 case "$ID" in
   ubuntu)
     init_ubuntu
+    install_boost
     ;;
   rocky)
     install_python_rockylinux $1
     install_pyp_rockylinux
     install_gcctoolset_rockylinux
+    install_boost
     ;;
   *)
     echo "Unable to determine OS..."

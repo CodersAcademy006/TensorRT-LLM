@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingKernels.h"
@@ -30,8 +31,7 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
@@ -345,6 +345,7 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         int const srcBeam = bid * nBM + i;
         int const dstBeam = bid * nBM * 2 + i + indexDstStart;
         int const step = bh.sequenceLengths[srcBeam] - 1;
+        int const inputLength = bh.inputLengths[srcBeam];
 
         // The last token
         int const srcId = srcBeam * nMSL + step;
@@ -356,7 +357,7 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         }
         // Previous tokens
         int prevId = bh.parentIdsUnfinish[srcId];
-        for (int j = step - 1; j >= 0; --j)
+        for (int j = step - 1; j >= inputLength; --j)
         {
             int const index = bid * nBM * nMSL + prevId * nMSL + j;
             bh.outputIdsCBA[dstBeam * nMSL + j] = bh.outputIdsUnfinish[index];
@@ -365,7 +366,7 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         if (bOutputLogProbs)
         {
             prevId = bh.parentIdsUnfinish[srcId];
-            for (int j = step - 1; j >= 0; --j)
+            for (int j = step - 1; j >= inputLength; --j)
             {
                 int const index = bid * nBM * nMSL + prevId * nMSL + j;
                 bh.logProbsCBA[dstBeam * nMSL + j] = bh.logProbsTiled[j * nMBS * nBM + bid * nBM + prevId];
@@ -498,17 +499,26 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     // Move bh.outputIds, bh.logProbs
     for (int beamIdx = 0; beamIdx < nBM; beamIdx++)
     {
+        int const inputLength = bh.inputLengths[bid * nBM + beamIdx];
         for (int i = tid; i < smemSL[beamIdx]; i += blockDim.x)
         {
             int const dst = bid * nBM * nMSL + beamIdx * nMSL + i;
-            int const src = bid * nBM * 2 * nMSL + smemRank[beamIdx] * nMSL + i;
-            bh.outputIds[dst] = bh.outputIdsCBA[src];
+            if (i < inputLength)
+            {
+                int const src = bid * nBM * nMSL + beamIdx * nMSL + i;
+                bh.outputIds[dst] = bh.outputIdsUnfinish[src];
+            }
+            else
+            {
+                int const src = bid * nBM * 2 * nMSL + smemRank[beamIdx] * nMSL + i;
+                bh.outputIds[dst] = bh.outputIdsCBA[src];
+            }
         }
         if (bh.logProbs != nullptr)
         {
             for (int i = tid; i < smemSL[beamIdx]; i += blockDim.x)
             {
-                if (int const inputLength = bh.inputLengths[bid * nBM + beamIdx]; i >= inputLength)
+                if (i >= inputLength)
                 {
                     int const dst = bid * nBM * nMSL + beamIdx * nMSL + i;
                     int const src = bid * nBM * 2 * nMSL + smemRank[beamIdx] * nMSL + i;
@@ -712,7 +722,9 @@ void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, 
 
 } // namespace kernels
 
-namespace runtime::kernels
+TRTLLM_NAMESPACE_END
+
+namespace tensorrt_llm::runtime::kernels
 {
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
@@ -802,6 +814,4 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-} // namespace runtime::kernels
-
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::runtime::kernels

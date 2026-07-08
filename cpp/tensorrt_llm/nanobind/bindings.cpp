@@ -38,11 +38,14 @@
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
+#include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
+#include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
@@ -80,7 +83,6 @@ tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& con
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
     m.doc() = "TensorRT LLM Python bindings for C++ runtime";
-    m.attr("binding_type") = "nanobind";
     nb::set_leak_warnings(false);
 
     // Create MpiComm binding first since it's used in the executor bindings
@@ -131,6 +133,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
+    auto mInternalBatchManagerKvCacheV2Utils
+        = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
@@ -214,7 +218,14 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("MOE_GATE", tr::LoraModule::ModuleType::kMOE_GATE)
         .value("MOE_ROUTER", tr::LoraModule::ModuleType::kMOE_ROUTER)
         .value("MLP_ROUTER", tr::LoraModule::ModuleType::kMLP_ROUTER)
-        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP);
+        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP)
+        .value("SHARED_EXPERT_H_TO_4H", tr::LoraModule::ModuleType::kSHARED_EXPERT_H_TO_4H)
+        .value("SHARED_EXPERT_4H_TO_H", tr::LoraModule::ModuleType::kSHARED_EXPERT_4H_TO_H)
+        .value("SHARED_EXPERT_GATE", tr::LoraModule::ModuleType::kSHARED_EXPERT_GATE)
+        .value("MAMBA_IN_PROJ", tr::LoraModule::ModuleType::kMAMBA_IN_PROJ)
+        .value("MAMBA_OUT_PROJ", tr::LoraModule::ModuleType::kMAMBA_OUT_PROJ)
+        .value("MOE_LATENT_FC1", tr::LoraModule::ModuleType::kMOE_LATENT_FC1)
+        .value("MOE_LATENT_FC2", tr::LoraModule::ModuleType::kMOE_LATENT_FC2);
 
     nb::class_<tr::LoraModule>(m, "LoraModule")
         .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),
@@ -230,7 +241,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_static("create_lora_modules", &tr::LoraModule::createLoraModules, nb::arg("lora_module_names"),
             nb::arg("hidden_size"), nb::arg("mlp_hidden_size"), nb::arg("num_attention_heads"),
             nb::arg("num_kv_attention_heads"), nb::arg("attention_head_size"), nb::arg("tp_size") = 1,
-            nb::arg("num_experts") = 0);
+            nb::arg("num_experts") = 0, nb::arg("shared_expert_hidden_size") = 0, nb::arg("moe_hidden_size") = 0,
+            nb::arg("mamba_in_proj_size") = 0, nb::arg("mamba_inner_size") = 0, nb::arg("moe_latent_size") = 0);
 
     nb::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
@@ -336,6 +348,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_rw("lora_modules", &tr::ModelConfig::getLoraModules, &tr::ModelConfig::setLoraModules)
         .def_prop_rw("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank)
         .def_prop_rw("mlp_hidden_size", &tr::ModelConfig::getMlpHiddenSize, &tr::ModelConfig::setMlpHiddenSize)
+        .def("num_lora_layers", &tr::ModelConfig::getNbLoraLayers, nb::arg("pipeline_parallelism") = 1,
+            nb::arg("pipeline_parallelism_rank") = 0)
+        .def("first_lora_layer", &tr::ModelConfig::getFirstLoraLayer, nb::arg("pipeline_parallelism") = 1,
+            nb::arg("pipeline_parallelism_rank") = 0)
+        .def("set_num_lora_layers", &tr::ModelConfig::setNbLoraLayers, nb::arg("num_lora_layers"))
         .def_prop_rw("size_per_head", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead);
 
     nb::class_<tr::WorldConfig>(m, "WorldConfig")
@@ -481,7 +498,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS)
-        .value("DISAGG_TRANS_ERROR", tb::LlmRequestState::kDISAGG_TRANS_ERROR);
+        .value("DISAGG_TRANS_ERROR", tb::LlmRequestState::kDISAGG_TRANS_ERROR)
+        .value("DISAGG_CONTEXT_WAIT_SCHEDULER", tb::LlmRequestState::kDISAGG_CONTEXT_WAIT_SCHEDULER)
+        .value("DISAGG_GENERATION_WAIT_TOKENS", tb::LlmRequestState::kDISAGG_GENERATION_WAIT_TOKENS);
 
     nb::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, nb::rv_policy::reference)
@@ -494,18 +513,23 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
+    tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
 
     tb::kv_cache_manager::KVCacheManagerConnectorBindings::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
+    tb::kv_cache_manager_v2::KVCacheManagerV2UtilsBindings::initBindings(mInternalBatchManagerKvCacheV2Utils);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
     tpb::algorithms::initBindings(mInternalAlgorithms);
 
     auto mUserbuffers = mInternal.def_submodule("userbuffers", "User buffers internal bindings");
     tensorrt_llm::kernels::userbuffers::UserBufferBindings::initBindings(mUserbuffers);
+
+    auto mSuffixAutomaton = mInternal.def_submodule("suffix_automaton", "Suffix automaton internal bindings");
+    tensorrt_llm::nanobind::suffix_automaton::initBindings(mSuffixAutomaton);
 
     // NVLS allocators
     nb::class_<tr::IpcNvlsHandle>(m, "IpcNvlsHandle")

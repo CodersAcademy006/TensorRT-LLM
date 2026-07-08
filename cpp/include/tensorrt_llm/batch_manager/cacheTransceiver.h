@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -33,6 +35,8 @@
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -190,25 +194,38 @@ public:
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
 };
 
+struct RequestStatuses
+{
+    /// Requests that have completed their transfer successfully.
+    std::unordered_set<LlmRequest::RequestIdType> completedRequestIds;
+    /// Requests that have encountered an error during their transfer.
+    std::unordered_set<LlmRequest::RequestIdType> errorRequestIds;
+};
+
 class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    virtual void respondAndSendAsync(LlmRequest* llmRequest) = 0;
+    // Async entry points take shared_ptr so the async worker holds a strong
+    // reference for the transfer lifetime; see CacheTransceiver::mSenderFutures.
+    virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
         = 0;
 
-    virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
-    virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
+    virtual void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) = 0;
+    virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
-    virtual void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
+    /// Check all requests transferring context, and return the requests that have completed or encountered an error.
+    virtual RequestStatuses checkContextTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false)
+        = 0;
 
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -219,37 +236,42 @@ public:
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
-        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {});
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
-        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt)
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {})
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP)
     {
     }
 
     virtual ~CacheTransceiver();
 
-    void respondAndSendAsync(LlmRequest* llmRequest) override;
+    void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress) override;
 
-    void requestAndReceiveSync(LlmRequest* llmRequest) override;
-    void requestAndReceiveAsync(LlmRequest* llmRequest) override;
+    void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
+    void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
-    void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
+    RequestStatuses checkContextTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) override;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
 private:
     void initializeCommState();
@@ -258,8 +280,20 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
+    // the transfer lifetime; otherwise Python's _terminate_request can drop the
+    // request while a C++ status check still dereferences it.
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
+    // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> mFailedSenderRequestIds;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mSenderRequestsAwaitingConsensus;
+    std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
@@ -270,7 +304,12 @@ private:
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
-    std::vector<kv_cache_manager::CacheTransBufferManager*> mCacheTransBufferManagerPtrs;
+    std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
+
+    rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
+    // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
+    std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
+
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;

@@ -2,20 +2,20 @@
 
 set -ex
 
-TRT_VER="10.13.3.9"
+TRT_VER="10.15.1.29"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-10.html#rel-25-10
-CUDA_VER="13.0" # 13.0.2
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-02.html#rel-26-02
+CUDA_VER="13.1" # 13.1.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.14.0.64-1"
-NCCL_VER="2.27.7-1+cuda13.0"
-CUBLAS_VER="13.1.0.3-1"
+CUDNN_VER="9.19.0.56-1"
+NCCL_VER="2.29.2-1+cuda13.1"
+CUBLAS_VER="13.2.1.1-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.0.88-1"
-CUDA_RUNTIME="13.0.96-1"
-CUDA_DRIVER_VERSION="580.95.05-1.el8"
+NVRTC_VER="13.1.115-1"
+CUDA_RUNTIME="13.1.80-1"
+CUDA_DRIVER_VERSION="590.48.01-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -39,6 +39,11 @@ install_ubuntu_requirements() {
     ARCH=$(uname -m)
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+
+    # this file exists in cuda base image, and has conflicts with cuda-keyring with the following error, so we need to remove it first:
+    # E: Conflicting values set for option Signed-By regarding
+    # source https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/ /: /usr/share/keyrings/cuda-archive-keyring.gpg !=
+    rm -f /etc/apt/sources.list.d/cuda.list
 
     curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH}/cuda-keyring_1.1-1_all.deb
     dpkg -i cuda-keyring_1.1-1_all.deb
@@ -118,6 +123,7 @@ install_rockylinux_requirements() {
 install_tensorrt() {
     PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
+
     TRT_CUDA_VERSION=${CUDA_VER}
     TRT_VER_SHORT=$(echo $TRT_VER | cut -d. -f1-3)
 

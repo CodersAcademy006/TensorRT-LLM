@@ -49,6 +49,8 @@ enum class Attention_mask_type
     CAUSAL,
     // Causal mask + attend to the specific sliding window or chunk.
     SLIDING_OR_CHUNKED_CAUSAL,
+    // Bidirectional sliding window attention.
+    BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
     CUSTOM_MASK,
 };
@@ -62,6 +64,7 @@ static inline std::string mask_type_to_string(Attention_mask_type mask_type)
     case Attention_mask_type::PADDING: return "padding";
     case Attention_mask_type::CAUSAL: return "causal";
     case Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL: return "sliding_or_chunked_causal";
+    case Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW: return "bidirectional_sliding_window";
     case Attention_mask_type::CUSTOM_MASK: return "custom_mask";
     default: assert(false); return "";
     }
@@ -283,6 +286,16 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+    // A positive value means skip-softmax is enabled.
+    float skip_softmax_threshold_scale_factor = 0;
+
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
 
 #endif
@@ -322,6 +335,8 @@ struct Fused_multihead_attention_launch_params
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
+    // skip softmax attention
+    bool enable_skip_softmax = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

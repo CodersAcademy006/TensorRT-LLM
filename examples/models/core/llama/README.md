@@ -1,5 +1,11 @@
 # LLaMA
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a LLaMA model in TensorRT LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
 - [LLaMA](#llama)
@@ -1542,7 +1548,7 @@ This section provides the steps to run LLaMa-3.3 70B model FP8 precision on PyTo
 
 ### Prepare TensorRT LLM extra configs
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 stream_interval: 10
 cuda_graph_config:
   max_batch_size: 1024
@@ -1566,7 +1572,7 @@ trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
     --max_batch_size 1024 \
     --trust_remote_code \
     --num_postprocess_workers 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 ### Run performance benchmarks

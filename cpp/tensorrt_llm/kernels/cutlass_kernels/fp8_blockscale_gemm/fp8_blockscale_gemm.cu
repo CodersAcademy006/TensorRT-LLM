@@ -16,9 +16,12 @@
 
 #include "fp8_blockscale_gemm.h"
 #include "fp8_blockscale_gemm_kernel.cuh"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::fp8_blockscale_gemm
 {
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -131,6 +134,23 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
             fp8_mat_b = reinterpret_cast<__nv_fp8_e4m3*>(const_cast<void*>(mat_b));
             per_block_scales = const_cast<float*>(scales_b);
         }
+    }
+
+    int arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 120)
+    {
+        if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
+        {
+            fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
+                nullptr, fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets,
+                num_problems, expected_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+                internal_quantize_a, internal_quantize_b);
+        }
+        else
+        {
+            TLLM_THROW("sm120 fp8 blockscale moe gemm only supports ElementA=bfloat16, ElementB=fp8_e4m3.");
+        }
+        return;
     }
 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
@@ -310,4 +330,6 @@ template class CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+} // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

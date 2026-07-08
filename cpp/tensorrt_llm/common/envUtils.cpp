@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -25,7 +26,9 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::optional<int32_t> getIntEnv(char const* name)
@@ -148,21 +151,6 @@ bool forceXQAKernels()
     return forceXQA;
 }
 
-std::optional<bool> getEnvEnableXQAJIT()
-{
-    static std::optional<bool> val = []
-    {
-        std::optional<bool> val = std::nullopt;
-        auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
-        if (tmp.has_value())
-        {
-            val = static_cast<bool>(tmp.value());
-        }
-        return val;
-    }();
-    return val;
-}
-
 std::optional<int> getEnvXqaBlocksPerSequence()
 {
     static auto const xqaBlocksPerSeq = []()
@@ -246,7 +234,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
-    static bool enablePDL = false;
+    static bool enablePDL = true;
 
     std::call_once(flag,
         [&]()
@@ -254,10 +242,30 @@ bool getEnvEnablePDL()
             if (getSMVersion() >= 90)
             {
                 // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+                char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+                if (env)
+                {
+                    if (env[0] == '1' && env[1] == '\0')
+                    {
+                        enablePDL = true;
+                    }
+                    else if (env[0] == '0' && env[1] == '\0')
+                    {
+                        enablePDL = false;
+                    }
+                };
             }
         });
     return enablePDL;
+}
+
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
+{
+    static std::once_flag flag;
+    static bool enabled = false;
+
+    std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
+    return enabled;
 }
 
 bool getEnvUseUCXKvCache()
@@ -278,10 +286,10 @@ bool getEnvUseNixlKvCache()
     return useNixlKvCache;
 }
 
-bool getEnvUseRoundRobinBlockDistForCP()
+bool getEnvUseMooncakeKvCache()
 {
-    static bool const useRoundRobinBlockDistForCP = getBoolEnv("TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP");
-    return useRoundRobinBlockDistForCP;
+    static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
+    return useMooncakeKvCache;
 }
 
 std::string getEnvUCXInterface()
@@ -338,6 +346,23 @@ std::string getEnvNixlBackend()
             }
         });
     return nixlBackend;
+}
+
+std::string getEnvMooncakeInterface()
+{
+    static std::once_flag flag;
+    static std::string mooncakeInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* mooncake_interface = std::getenv("TRTLLM_MOONCAKE_INTERFACE");
+            if (mooncake_interface)
+            {
+                mooncakeInterface = mooncake_interface;
+            }
+        });
+    return mooncakeInterface;
 }
 
 bool getEnvDisaggLayerwise()
@@ -474,6 +499,12 @@ uint16_t getEnvNixlPort()
     return nixlPort;
 }
 
+bool getEnvNixlEnableCoalesce()
+{
+    static bool const enableCoalesce = getBoolEnv("TRTLLM_NIXL_ENABLE_COALESCE");
+    return enableCoalesce;
+}
+
 bool getEnvDisaggBenchmarkGenOnly()
 {
     return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
@@ -482,17 +513,6 @@ bool getEnvDisaggBenchmarkGenOnly()
 bool getEnvDisableChunkedAttentionInGenPhase()
 {
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
-}
-
-bool getEnvMoeA2AOneBlockPerToken()
-{
-    // Default true; return false only if env set to "0"
-    static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
-    if (!val.has_value())
-    {
-        return true;
-    }
-    return val.value() != 0;
 }
 
 static int sanitizeBlockSize(std::optional<int32_t> const& val)
@@ -511,15 +531,31 @@ static int sanitizeBlockSize(std::optional<int32_t> const& val)
     return block;
 }
 
+// Read an integer env var and sanitize it as a CUDA block size. Treats malformed
+// values (e.g. non-numeric strings that would throw inside std::stoi) as unset and
+// falls back to the default, so this debug knob never becomes a hard failure.
+static int getSanitizedBlockSizeFromEnv(char const* name)
+{
+    try
+    {
+        return sanitizeBlockSize(getIntEnv(name));
+    }
+    catch (std::exception const&)
+    {
+        TLLM_LOG_WARNING("Invalid value for %s. Falling back to default block size.", name);
+        return sanitizeBlockSize(std::nullopt);
+    }
+}
+
 int getEnvMoeA2ADispatchBlockSize()
 {
-    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"));
+    static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
     return kBlock;
 }
 
 int getEnvMoeA2ACombineBlockSize()
 {
-    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
+    static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE");
     return kBlock;
 }
 
@@ -528,4 +564,11 @@ bool getEnvEplbForceGdrcopy()
     return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
 }
 
-} // namespace tensorrt_llm::common
+bool getEnvPrintSkipSoftmaxStat()
+{
+    return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
+}
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

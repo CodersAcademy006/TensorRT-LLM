@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import os
 from abc import ABC, abstractmethod
@@ -6,9 +20,36 @@ from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
+from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
+
+MAX_TOP_LOGPROBS = 20
+
+
+def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
+    """Validate ``thinking_token_budget``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    if value == -1:
+        return None
+    if value < 0:
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    return value
+
+
+def check_logprobs_limit(
+    name: str, value: Optional[int], max_value: int = MAX_TOP_LOGPROBS
+) -> None:
+    if value is None:
+        return
+    if value < 0:
+        raise ValueError(f"{name} must be positive, zero or None")
+    if value > max_value:
+        raise ValueError(f"{name} must be less than or equal to {max_value}")
 
 
 @dataclass(slots=True, kw_only=True)
@@ -44,6 +85,24 @@ class LogprobParams(NamedTuple):
     drop_context_logits: bool = False
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
+    # Return generation logprobs as `list[float]` instead of the default
+    # `list[dict[int, Logprob]]`. Only valid when logprobs == 0.
+    logprobs_simple_format: bool = False
+    # Return prompt logprobs as `list[float]` instead of the default
+    # `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.
+    prompt_logprobs_simple_format: bool = False
+
+
+class LogprobMode(StrEnum):
+    RAW = "raw"
+    """
+    Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    """
+    PROCESSED = "processed"
+    """
+    Return the processed log probabilities, i.e., the log probabilities after applying sampling parameters,
+    such as temperature, top-k, top-p, etc.
+    """
 
 
 class LogitsProcessor(ABC):
@@ -172,8 +231,13 @@ class SamplingParams:
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
-        logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
-        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
+        logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
+                                  When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.
+        logprobs_simple_format (bool): If True (and `logprobs == 0`), return generation logprobs as a flat `list[float]` (one logprob per generated token) instead of the default `list[dict[int, Logprob]]` format. Reduces per-token allocation overhead when only the sampled-token logprob is needed. Incompatible with `logprobs is None or logprobs > 0` and with beam search. Defaults to False.
+        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. When set to 0, return only the actual prompt token's log probability.
+                                  When set to K>0, return top-K log probabilities + the actual prompt token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        prompt_logprobs_simple_format (bool): If True (and `prompt_logprobs == 0`), return prompt logprobs as a flat `list[float]` instead of the default `list[dict[int, Logprob]]` format. Incompatible with `prompt_logprobs is None or prompt_logprobs > 0`. Defaults to False.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -183,6 +247,7 @@ class SamplingParams:
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
+        thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -219,6 +284,7 @@ class SamplingParams:
     n: int = 1
     best_of: Optional[int] = None
     use_beam_search: bool = False
+    logprobs_mode: LogprobMode = LogprobMode.RAW
 
     # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
     top_k: Optional[int] = None
@@ -243,6 +309,8 @@ class SamplingParams:
     # Keep the below fields in sync with tllme.OutputConfig
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
+    logprobs_simple_format: bool = False
+    prompt_logprobs_simple_format: bool = False
     return_context_logits: bool = False
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
@@ -263,6 +331,7 @@ class SamplingParams:
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
+    thinking_token_budget: Optional[int] = None
 
     # Tokenizer-related configs
     ignore_eos: bool = False
@@ -321,6 +390,8 @@ class SamplingParams:
                 f"under the greedy decoding."
             )
 
+        self.logprobs_mode = LogprobMode(self.logprobs_mode)
+
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
             raise ValueError(
                 f"truncate_prompt_tokens must be >= 1, got {self.truncate_prompt_tokens}"
@@ -328,18 +399,39 @@ class SamplingParams:
 
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
+        self.thinking_token_budget = validate_thinking_token_budget(self.thinking_token_budget)
 
-        # correct types as users might pass in logprob=True for Top-1 logprobs
-        self.logprobs = self.logprobs and int(self.logprobs)
-        self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
+        # correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs
+        if self.logprobs is False:
+            self.logprobs = None
+        if self.logprobs is True:
+            self.logprobs = 0
+        check_logprobs_limit("logprobs", self.logprobs)
+        check_logprobs_limit("prompt_logprobs", self.prompt_logprobs)
+
+        if self.logprobs_simple_format and self.logprobs != 0:
+            raise ValueError(
+                f"logprobs_simple_format=True requires logprobs == 0, got logprobs={self.logprobs}"
+            )
+        if self.prompt_logprobs_simple_format and self.prompt_logprobs != 0:
+            raise ValueError(
+                "prompt_logprobs_simple_format=True requires prompt_logprobs == 0, got "
+                f"prompt_logprobs={self.prompt_logprobs}"
+            )
+        if self.logprobs_simple_format and self.use_beam_search:
+            raise ValueError("logprobs_simple_format is not supported with beam search")
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).
     @staticmethod
     def params_imply_greedy_decoding(
-        *, temperature: Optional[float], top_p: Optional[float], top_k: Optional[int]
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+        use_beam_search: bool | None,
     ):
-        return (
+        return (not use_beam_search) and (
             (temperature is None and top_p is None and top_k is None)
             or top_k == 1
             or top_p == 0.0
@@ -348,10 +440,11 @@ class SamplingParams:
 
     @property
     def _greedy_decoding(self) -> bool:
-        return not self.use_beam_search and self.params_imply_greedy_decoding(
+        return self.params_imply_greedy_decoding(
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,
+            use_beam_search=self.use_beam_search,
         )
 
     @property
@@ -368,14 +461,6 @@ class SamplingParams:
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
-            # kimi_k2 model uses the eos_token_id in generation config
-            if (
-                hf_model_config is not None
-                and hf_model_config.model_type == "kimi_k2"
-                and generation_config is not None
-                and isinstance(generation_config.eos_token_id, int)
-            ):
-                self.end_id = generation_config.eos_token_id
 
             if self.pad_id is None:
                 self.pad_id = self.end_id
@@ -395,24 +480,20 @@ class SamplingParams:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
             self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
-        # add generation_config to stop word list, only in qwen3-next now
-        if (
-            hf_model_config is not None
-            and hf_model_config.model_type == "qwen3_next"
-            and generation_config is not None
-            and isinstance(generation_config.eos_token_id, List)
-            and all(isinstance(i, int) for i in generation_config.eos_token_id)
-        ):
-            if self._stop_word_ids:
-                all_stop_tokens_id = set(i for sublist in self._stop_word_ids for i in sublist)
-                from_generation_stop_tokens = [
-                    i for i in generation_config.eos_token_id if i not in all_stop_tokens_id
-                ]
+        # Add eos_token_id in generation_config to stop_token_ids
+        # The eos_token_id in generation_config are really mean to stop the text generation.
+        if generation_config is not None and generation_config.eos_token_id is not None:
+            if isinstance(generation_config.eos_token_id, int):
+                generation_config.eos_token_id = [generation_config.eos_token_id]
+            # else is always List[int]
 
-                if from_generation_stop_tokens:
-                    self._stop_word_ids.append(from_generation_stop_tokens)
-            else:
-                self._stop_word_ids = [generation_config.eos_token_id]
+            if not self.stop_token_ids:
+                self.stop_token_ids = []
+            for stop_token in generation_config.eos_token_id:
+                if stop_token != self.end_id and stop_token not in self.stop_token_ids:
+                    self.stop_token_ids.append(stop_token)
+            if not self.stop_token_ids:
+                self.stop_token_ids = None
 
         return self
 
@@ -501,8 +582,8 @@ class SamplingParams:
         config_kwargs = {f: getattr(self, f) for f in fields}
 
         if is_pytorch_backend:
-            config_kwargs["return_log_probs"] = bool(self.logprobs)
-            if self.prompt_logprobs and not self.return_context_logits:
+            config_kwargs["return_log_probs"] = self.logprobs is not None
+            if self.prompt_logprobs is not None and not self.return_context_logits:
                 logger.info(
                     "Since prompt_logprobs is requested but return_context_logits is False, "
                     "internally enabling context logits for prompt logprobs computation. "

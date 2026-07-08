@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -63,6 +64,16 @@ struct XQAParams
     uint32_t* spec_decoding_bl_tree_mask;              // for blackwell spec-dec tree mask
     int32_t* spec_bl_tree_first_sparse_mask_offset_kv; // for blackwell spec-dec tree first sparse mask offset kv
     int32_t const* mrope_position_deltas = nullptr;
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets = nullptr;
+    bool const* helix_is_inactive_rank = nullptr;
+    // Softmax stats output buffer for Helix parallelism (max and LSE per head).
+    float2* softmax_stats = nullptr;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllm_gen_jit_warmup = false;
+    int32_t trtllm_gen_jit_warmup_max_num_requests = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_q = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_kv = 0;
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
@@ -115,7 +126,15 @@ struct XQAParams
 
     // sparse attention parameters
     SparseAttentionParams sparse_params;
-    bool use_sparse_attention = false;
+    bool use_sparse_attention_gen_paged = false;
+
+    // Skip softmax threshold.
+    float skip_softmax_threshold_scale_factor = 0;
+
+#ifdef SKIP_SOFTMAX_STAT
+    uint32_t* skip_softmax_total_blocks = nullptr;
+    uint32_t* skip_softmax_skipped_blocks = nullptr;
+#endif
 
     cudaStream_t stream = 0;
     // layer index
@@ -158,6 +177,9 @@ struct XQAParams
            << "spec_decoding_bl_tree_mask: " << spec_decoding_bl_tree_mask << std::endl
            << "spec_bl_tree_first_sparse_mask_offset_kv: " << spec_bl_tree_first_sparse_mask_offset_kv << std::endl
            << "mrope_position_deltas: " << mrope_position_deltas << std::endl
+           << "helix_position_offsets: " << helix_position_offsets << std::endl
+           << "helix_is_inactive_rank: " << helix_is_inactive_rank << std::endl
+           << "softmax_stats: " << softmax_stats << std::endl
            << "generation_input_length: " << generation_input_length << std::endl
            << "num_q_heads: " << num_q_heads << std::endl
            << "num_kv_heads: " << num_kv_heads << std::endl
@@ -193,7 +215,12 @@ struct XQAParams
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
            << "sparse_params: " << sparse_params.toString() << std::endl
-           << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
+           << "use_sparse_attention_gen_paged :" << (use_sparse_attention_gen_paged ? "true" : "false") << std ::endl
+           << "skip_softmax_threshold_scale_factor :" << skip_softmax_threshold_scale_factor << std ::endl
+#ifdef SKIP_SOFTMAX_STAT
+           << "skip_softmax_total_blocks :" << skip_softmax_total_blocks << std ::endl
+           << "skip_softmax_skipped_blocks :" << skip_softmax_skipped_blocks << std ::endl
+#endif
            << "stream :" << stream;
 
         return ss.str();
@@ -206,4 +233,5 @@ struct XQAParams
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

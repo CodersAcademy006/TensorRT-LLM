@@ -1,11 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import json
 import threading
-from typing import Optional
+from typing import List, Optional, Union
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
-from ..llmapi.utils import logger_debug
+from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
+from .proxy import _check_collective_rpc_guard
+from .result import IterationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
 from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
@@ -46,6 +63,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             is_llm_executor=is_llm_executor,
         )
 
+        self.model_world_size = model_world_size
         self._create_mpi_session(model_world_size, mpi_session)
 
         # Inject the generated HMAC key into worker_kwargs for workers
@@ -69,20 +87,152 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                                 **self.worker_kwargs)
 
     def _setup_mainloop_with_tasks(self):
-        """Setup mainloop with all tasks needed for RpcProxy."""
+        """Setup mainloop with tasks needed for RpcProxy.
+
+        Note: Stats and kv_events are now fetched on-demand via direct RPC calls
+        (get_stats, aget_stats, get_kv_events, aget_kv_events), not via streaming loops.
+        """
         tasks = [
             self._fetch_responses_loop_async,
-            self._fetch_stats_loop_async,
         ]
-        # Only add kv_cache_events loop if it's enabled
-        if self._iter_kv_events_result:
-            tasks.append(self._fetch_kv_cache_events_loop_async)
-
         # Call mixin's setup_mainloop with custom tasks
         self.setup_mainloop(tasks=tasks, thread_name="rpc_proxy_main_loop")
 
-    def fetch_stats_remote(self):
-        return self.rpc_client.fetch_stats().remote()
+    def get_stats(self, timeout: float) -> List[dict]:
+        """Get iteration statistics from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime stats as dict.
+        """
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(s) if isinstance(s, str) else s for s in stats]
+        except Exception as e:
+            logger.debug(f"Error fetching stats via RPC: {e}")
+            return []
+
+    def aget_stats(self, timeout: float) -> IterationResult:
+        """Get iteration statistics from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime stats.
+        """
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_stats_result is None:
+            print_colored("Iteration statistics are not available yet.\n",
+                          "yellow")
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch stats via RPC and populate the result
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+        except Exception:
+            stats = []
+
+        for stat in stats:
+            self._iter_stats_result.queue.put(stat)
+
+        self._iter_stats_result.set_timeout(timeout)
+        return self._iter_stats_result
+
+    def get_kv_events(self, timeout: float) -> List[dict]:
+        """Get iteration KV events from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        """
+        try:
+            # Events are already serialized by the worker's fetch_kv_cache_events_wait_async()
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(e) if isinstance(e, str) else e for e in events]
+        except Exception as e:
+            logger.debug(f"Error fetching kv events via RPC: {e}")
+            return []
+
+    def aget_kv_events(self, timeout: float) -> IterationResult:
+        """Get iteration KV events from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime events.
+        """
+        # Initialize iteration result if needed
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_kv_events_result is None:
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch kv events via RPC and populate the result
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+        except Exception:
+            events = []
+
+        for event in events:
+            self._iter_kv_events_result.queue.put(event)
+
+        self._iter_kv_events_result.set_timeout(timeout)
+        return self._iter_kv_events_result
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 RpcWorker via the RPC client.
+
+        Rank-0-only shim; only ``model_world_size == 1`` is supported.
+        See :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
+        for details.
+
+        Args:
+            method: Name of the
+                :class:`~tensorrt_llm.executor.rpc_worker.RpcWorker` method
+                to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value (blocking) or a list
+            containing the pending :class:`~concurrent.futures.Future`
+            (non-blocking).
+
+        Raises:
+            NotImplementedError: If ``model_world_size > 1``, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
+        """
+        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
+                                    target_ranks)
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
 
     def setup_engine_remote(self):
         return self.rpc_client.setup_engine().remote(need_response=True)

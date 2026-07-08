@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,8 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <limits>
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -29,11 +31,19 @@ std::string genUniqueAgentName()
 {
     static std::atomic<uint64_t> counter{0};
 
-    // hostname+pid+counter++
+    // Generate a per-process random suffix to disambiguate agents across containers
+    // that may share the same hostname (--network host) and PID namespace.
+    static uint64_t const sRandomSuffix = []()
+    {
+        std::random_device rd;
+        return (static_cast<uint64_t>(rd()) << 32) | rd();
+    }();
+
     char hostname[1024];
     gethostname(hostname, sizeof(hostname));
     auto pid = static_cast<uint64_t>(::getpid());
-    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(counter++);
+    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(sRandomSuffix) + "_"
+        + std::to_string(counter++);
 }
 
 // NIXL connection is specific, and different from the UCX and mpi connection,
@@ -45,10 +55,8 @@ std::string genUniqueAgentName()
 // layer num, since the buffer size is ratio is equal to the layer num ratio
 // except the VSWA case.
 
-auto computeSendOffsetRatio(
-    CacheState const& peerCacheState, int peerIdx, CacheState const& selfCacheState, int connectionIdx)
+auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectionIdx)
 {
-    auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
     size_t offsetLayer = 0;
     for (int i = 0; i < connectionIdx; i++)
     {
@@ -58,6 +66,46 @@ auto computeSendOffsetRatio(
     size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(connectionIdx);
     return std::make_pair(offsetLayer, selfSendLayer);
 }
+
+namespace
+{
+
+bool isValidBufferKind(uint8_t kind)
+{
+    switch (static_cast<batch_manager::BufferKind>(kind))
+    {
+    case batch_manager::BufferKind::kKV:
+    case batch_manager::BufferKind::kKV_INDEXER:
+    case batch_manager::BufferKind::kRNN: return true;
+    }
+    return false;
+}
+
+AgentState const* findAgentState(CommState const& commState, std::string const& agentName)
+{
+    if (!commState.isAgentState())
+    {
+        return nullptr;
+    }
+    for (auto const& agentState : commState.getAgentState())
+    {
+        if (agentState.mAgentName == agentName)
+        {
+            return &agentState;
+        }
+    }
+    return nullptr;
+}
+
+void validateConnectionIdx(
+    int connectionIdx, TargetRanksInfo const& targetInfo, char const* bufferKind, std::string const& remoteAgentName)
+{
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(connectionIdx) < targetInfo.mIRanks.size(),
+        "AgentConnectionManager received %s connection index %d outside target rank count %zu from agent '%s'",
+        bufferKind, connectionIdx, targetInfo.mIRanks.size(), remoteAgentName.c_str());
+}
+
+} // namespace
 
 AgentConnection::AgentConnection(
     std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager)
@@ -71,22 +119,6 @@ AgentConnection::AgentConnection(
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
 }
 
-std::optional<size_t> AgentConnection::getCacheBufferId(size_t bufferIdx) const
-{
-    TLLM_CHECK(bufferIdx < mCacheBufferIds.size());
-    return mCacheBufferIds[bufferIdx];
-}
-
-size_t AgentConnection::getSenderBufferCount() const
-{
-    return mSenderState.mCacheReceiverBufferDescs.size();
-}
-
-void AgentConnection::setActiveSenderBufferIdx(size_t bufferIdx)
-{
-    mSenderState.setActiveBufferIdx(bufferIdx);
-}
-
 MemoryDesc const& AgentConnection::SenderState::activeBufferDesc() const
 {
     TLLM_CHECK(!mCacheReceiverBufferDescs.empty());
@@ -94,7 +126,14 @@ MemoryDesc const& AgentConnection::SenderState::activeBufferDesc() const
     return mCacheReceiverBufferDescs[mActiveBufferIdx];
 }
 
-void AgentConnection::SenderState::setActiveBufferIdx(size_t bufferIdx)
+std::pair<size_t, size_t> const& AgentConnection::SenderState::activeOffsetRatio() const
+{
+    TLLM_CHECK(!mOffsetRatios.empty());
+    TLLM_CHECK(mActiveBufferIdx < mOffsetRatios.size());
+    return mOffsetRatios[mActiveBufferIdx];
+}
+
+void AgentConnection::SenderState::setActiveBufferIdx(size_t bufferIdx) const
 {
     TLLM_CHECK(bufferIdx < mCacheReceiverBufferDescs.size());
     mActiveBufferIdx = bufferIdx;
@@ -130,7 +169,16 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
     auto const& dstBaseDesc = mSenderState.activeBufferDesc();
-    auto offset = size / mSenderState.mOffsetRatio.second * mSenderState.mOffsetRatio.first;
+    auto const& offsetRatio = mSenderState.activeOffsetRatio();
+    TLLM_CHECK_WITH_INFO(offsetRatio.second != 0, "AgentConnection::send offset ratio denominator cannot be 0");
+    TLLM_CHECK_WITH_INFO(size <= dstBaseDesc.getLen(), "AgentConnection::send size exceeds destination buffer");
+    auto const chunkSize = size / offsetRatio.second;
+    TLLM_CHECK_WITH_INFO(offsetRatio.first == 0 || chunkSize <= std::numeric_limits<size_t>::max() / offsetRatio.first,
+        "AgentConnection::send offset calculation overflow");
+    auto const offset = chunkSize * offsetRatio.first;
+    TLLM_CHECK_WITH_INFO(offset <= dstBaseDesc.getLen() - size, "AgentConnection::send destination out of bounds");
+    TLLM_CHECK_WITH_INFO(dstBaseDesc.getAddr() <= std::numeric_limits<uintptr_t>::max() - offset,
+        "AgentConnection::send destination address overflow");
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
@@ -141,7 +189,8 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    status->wait();
+    TransferState transferState = status->wait();
+    TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
@@ -150,7 +199,7 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 {
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
-    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
+    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
@@ -159,27 +208,38 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
     TLLM_CHECK(!cacheBufferIds.empty());
-    TLLM_CHECK(cacheBufferIds.size() == mCacheTransBufferManagers.size());
-    auto preAllocateBuffers = std::vector<runtime::ITensor::SharedPtr>();
-    preAllocateBuffers.reserve(cacheBufferIds.size());
+    TLLM_CHECK(cacheBufferIds.size() <= mCacheTransBufferManagers.size());
+
+    auto const& allKinds = mAgentConnectionManager->getBufferKinds();
+    std::vector<runtime::ITensor::SharedPtr> preAllocateBuffers;
     std::vector<MemoryDesc> bufferDescs;
-    bufferDescs.reserve(cacheBufferIds.size());
+    std::vector<std::optional<size_t>> activeCacheBufferIds;
+    std::vector<uint8_t> activeKinds;
+
     for (size_t i = 0; i < cacheBufferIds.size(); i++)
     {
-        TLLM_CHECK(cacheBufferIds[i].has_value());
+        if (!cacheBufferIds[i].has_value())
+        {
+            continue;
+        }
         auto preAllocateBuffer = mCacheTransBufferManagers[i]->getRecvBuffer(cacheBufferIds[i].value());
-        preAllocateBuffers.push_back(preAllocateBuffer);
         TLLM_CHECK(preAllocateBuffer != nullptr);
+        preAllocateBuffers.push_back(preAllocateBuffer);
+        activeCacheBufferIds.push_back(cacheBufferIds[i]);
+        activeKinds.push_back(allKinds[i]);
     }
-    mCacheBufferIds = cacheBufferIds;
+    TLLM_CHECK(!activeCacheBufferIds.empty());
+
+    mCacheBufferIds = std::move(activeCacheBufferIds);
+    mBufferKinds = activeKinds;
+
     int deviceId = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
     TLLM_CHECK(deviceId != -1);
     TLLM_CHECK(deviceId == mAgentConnectionManager->getDeviceId());
-    for (size_t i = 0; i < preAllocateBuffers.size(); i++)
+    for (auto const& buf : preAllocateBuffers)
     {
-        bufferDescs.emplace_back(
-            reinterpret_cast<uintptr_t>(preAllocateBuffers[i]->data()), preAllocateBuffers[i]->getSize(), deviceId);
+        bufferDescs.emplace_back(reinterpret_cast<uintptr_t>(buf->data()), buf->getSizeInBytes(), deviceId);
     }
     std::string address = mAgentConnectionManager->getAgent()->getLocalConnectionInfo();
     std::optional<std::string> metadataOpt = std::nullopt;
@@ -191,21 +251,24 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     }
 
     RequestAndBufferInfo requestAndBufferInfo{
-        mAgentName, address, requestInfo, bufferDescs, metadataOpt, connectionIdx};
+        mAgentName, address, requestInfo, bufferDescs, metadataOpt, connectionIdx, activeKinds};
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
-void AgentConnection::setSenderState(
-    std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx, std::pair<size_t, size_t> offsetRatio)
+void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
+    std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds)
 {
     TLLM_CHECK(!cacheReceiverBufferDescs.empty());
+    TLLM_CHECK(offsetRatios.size() == cacheReceiverBufferDescs.size());
+    TLLM_CHECK(bufferKinds.size() == cacheReceiverBufferDescs.size());
     mSenderState.mCacheReceiverBufferDescs = std::move(cacheReceiverBufferDescs);
     mSenderState.validSegmentIdx = validSegmentIdx;
-    mSenderState.mOffsetRatio = offsetRatio;
+    mSenderState.mOffsetRatios = std::move(offsetRatios);
     mSenderState.setActiveBufferIdx(0);
+    mBufferKinds = std::move(bufferKinds);
 }
 
 void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)
@@ -230,14 +293,39 @@ void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) cons
 bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
-    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
-    return true;
+    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate());
+    return readySignalInfo.mIsReady;
+}
+
+void AgentConnection::activateBuffer(uint8_t kind) const
+{
+    for (size_t i = 0; i < mBufferKinds.size(); i++)
+    {
+        if (mBufferKinds[i] == kind)
+        {
+            mSenderState.setActiveBufferIdx(i);
+            return;
+        }
+    }
+}
+
+std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) const
+{
+    for (size_t i = 0; i < mBufferKinds.size(); i++)
+    {
+        if (mBufferKinds[i] == kind && i < mCacheBufferIds.size())
+        {
+            return mCacheBufferIds[i];
+        }
+    }
+    return std::nullopt;
 }
 
 AgentConnectionManager::AgentConnectionManager(
-    std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-    CacheState cacheState)
+    std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
     : mCacheState(std::move(cacheState))
+    , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
 {
@@ -246,13 +334,15 @@ AgentConnectionManager::AgentConnectionManager(
 
     mAgentName = genUniqueAgentName();
     // Create Agent
-    BaseAgentConfig config{mAgentName, true};
-    m_Agent = makeTransferAgent("nixl", &config);
+    BaseAgentConfig config{mAgentName, true, false, true};
+    m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
+    mBufferKinds.reserve(mCacheTransBufferManagers.size());
     std::vector<MemoryDesc> memDescs;
     for (auto* cacheTransBufferManager : mCacheTransBufferManagers)
     {
         TLLM_CHECK(cacheTransBufferManager != nullptr);
+        mBufferKinds.push_back(static_cast<uint8_t>(cacheTransBufferManager->getBufferKind()));
         auto recvBufferCount = cacheTransBufferManager->getRecvBufferCount();
         auto sendBufferCount = cacheTransBufferManager->getSendBufferCount();
         for (size_t i = 0; i < recvBufferCount; i++)
@@ -315,10 +405,15 @@ AgentConnectionManager::AgentConnectionManager(
         " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
 }
 
-AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batch_manager::RequestInfo& requestInfo)
+AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
+    batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag)
 {
-    while (true)
+    while (!terminateFlag.load())
     {
+        if (!mIsRunning)
+        {
+            return nullptr;
+        }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -337,17 +432,124 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
                     erase = true;
                     requestInfo = requestAndBufferInfo.mRequestInfo;
-                    auto address = requestAndBufferInfo.mAddress;
-                    auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
+                    auto const& address = requestAndBufferInfo.mAddress;
+                    auto const& bufferDescsRef = requestAndBufferInfo.mBufferDescs;
                     auto metadataOpt = requestAndBufferInfo.mMetadata;
-                    auto connectionIdx = requestAndBufferInfo.mValidConnectionIdx;
-                    auto remoteAgentName = requestAndBufferInfo.mAgentName;
+                    auto const connectionIdx = requestAndBufferInfo.mValidConnectionIdx;
+                    auto const& remoteAgentName = requestAndBufferInfo.mAgentName;
+                    auto const& bufferKindsRef = requestAndBufferInfo.mBufferKinds;
+
+                    TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
+                        "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
+                        agent.c_str(), remoteAgentName.c_str());
+                    auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
+                    if (expectedAgentState != nullptr)
+                    {
+                        TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
+                            "AgentConnectionManager received mismatched connection info for agent '%s'",
+                            remoteAgentName.c_str());
+                    }
+                    else
+                    {
+                        std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
+                        auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
+                        TLLM_CHECK_WITH_INFO(inserted || remoteInfoIt->second == address,
+                            "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
+                            remoteAgentName.c_str());
+                    }
+                    TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
+                        "AgentConnectionManager received negative connection index for agent '%s'",
+                        remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(!bufferDescsRef.empty(),
+                        "AgentConnectionManager received empty destination descriptors from agent '%s'",
+                        remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(bufferDescsRef.size() == bufferKindsRef.size(),
+                        "AgentConnectionManager received %zu descriptors but %zu buffer kinds from agent '%s'",
+                        bufferDescsRef.size(), bufferKindsRef.size(), remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(bufferDescsRef.size() <= mCacheTransBufferManagers.size(),
+                        "AgentConnectionManager received too many destination descriptors from agent '%s'",
+                        remoteAgentName.c_str());
+                    for (auto const kind : bufferKindsRef)
+                    {
+                        TLLM_CHECK_WITH_INFO(isValidBufferKind(kind),
+                            "AgentConnectionManager received invalid buffer kind %u from agent '%s'",
+                            static_cast<unsigned>(kind), remoteAgentName.c_str());
+                        bool isConfiguredKind = false;
+                        for (auto const configuredKind : mBufferKinds)
+                        {
+                            if (configuredKind == kind)
+                            {
+                                isConfiguredKind = true;
+                                break;
+                            }
+                        }
+                        TLLM_CHECK_WITH_INFO(isConfiguredKind,
+                            "AgentConnectionManager received unconfigured buffer kind %u from agent '%s'",
+                            static_cast<unsigned>(kind), remoteAgentName.c_str());
+                    }
+                    TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCacheState().has_value(),
+                        "AgentConnectionManager received request without cache state from agent '%s'",
+                        remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCommState().has_value(),
+                        "AgentConnectionManager received request without comm state from agent '%s'",
+                        remoteAgentName.c_str());
+
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
                     auto connection = connect(remoteAgentName, address, metadataOpt, true);
-                    // to compute the offset.
-                    auto offsetRatio = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
-                        requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState, connectionIdx);
-                    connection->setSenderState(std::move(bufferDescs), connectionIdx, offsetRatio);
+                    TLLM_CHECK_WITH_INFO(
+                        m_Agent->checkRemoteDescs(remoteAgentName, MemoryDescs{MemoryType::kVRAM, bufferDescsRef}),
+                        "AgentConnectionManager received unregistered destination descriptors from agent '%s'",
+                        remoteAgentName.c_str());
+                    auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
+                    auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
+
+                    std::optional<std::pair<size_t, size_t>> kvOffsetRatio;
+                    std::optional<std::pair<size_t, size_t>> rnnOffsetRatio;
+                    std::vector<std::pair<size_t, size_t>> offsetRatios;
+                    offsetRatios.reserve(bufferDescs.size());
+
+                    for (size_t bi = 0; bi < bufferDescs.size(); bi++)
+                    {
+                        auto kind = static_cast<batch_manager::BufferKind>(bufferKinds[bi]);
+                        switch (kind)
+                        {
+                        case batch_manager::BufferKind::kKV:
+                        case batch_manager::BufferKind::kKV_INDEXER:
+                        {
+                            if (!kvOffsetRatio)
+                            {
+                                auto kvTargetInfo
+                                    = targetIRanks(mCacheState, requestInfo.getTransState().getCacheState().value(),
+                                        requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, kvTargetInfo, "KV", remoteAgentName);
+                                kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
+                            }
+                            offsetRatios.push_back(*kvOffsetRatio);
+                            break;
+                        }
+                        case batch_manager::BufferKind::kRNN:
+                        {
+                            if (!rnnOffsetRatio)
+                            {
+                                auto rnnTargetInfo = targetIRanksForRnn(mCacheState,
+                                    requestInfo.getTransState().getCacheState().value(),
+                                    requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, rnnTargetInfo, "RNN", remoteAgentName);
+                                size_t rnnOffsetLayer = 0;
+                                for (int ri = 0; ri < connectionIdx; ri++)
+                                {
+                                    rnnOffsetLayer += rnnTargetInfo.getPeerPPDomainLayerNum(ri);
+                                }
+                                size_t rnnSendLayer = rnnTargetInfo.getPeerPPDomainLayerNum(connectionIdx);
+                                rnnOffsetRatio = std::make_pair(rnnOffsetLayer, rnnSendLayer);
+                            }
+                            offsetRatios.push_back(*rnnOffsetRatio);
+                            break;
+                        }
+                        }
+                    }
+                    connection->setSenderState(
+                        std::move(bufferDescs), connectionIdx, std::move(offsetRatios), std::move(bufferKinds));
                     notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {
@@ -406,10 +608,14 @@ BaseTransferAgent* AgentConnectionManager::getAgent() const
     return m_Agent.get();
 }
 
-std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> const&
-AgentConnectionManager::getCacheTransBufferManagers() const
+std::vector<batch_manager::BaseTransBufferManager*> const& AgentConnectionManager::getCacheTransBufferManagers() const
 {
     return mCacheTransBufferManagers;
+}
+
+std::vector<uint8_t> const& AgentConnectionManager::getBufferKinds() const
+{
+    return mBufferKinds;
 }
 
 AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
@@ -486,11 +692,16 @@ int AgentConnectionManager::getDeviceId() const
 }
 
 template <typename NotificationType>
-void AgentConnectionManager::waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo)
+void AgentConnectionManager::waitForNotification(
+    std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
-    while (true)
+    while (!terminateFlag.load())
     {
 
+        if (!mIsRunning)
+        {
+            return;
+        }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -566,18 +777,20 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
 
 // Explicit template instantiations
 template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
-    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo);
+    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
 template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
-    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo);
+    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
 
-void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo)
+void AgentConnectionManager::waitForSyncInfo(
+    std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, syncInfo);
+    waitForNotification(remoteAgentName, syncInfo, terminateFlag);
 }
 
-void AgentConnectionManager::waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo)
+void AgentConnectionManager::waitForReadySignal(
+    std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, readySignalInfo);
+    waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const
@@ -587,6 +800,13 @@ std::string const& AgentConnectionManager::getAgentName() const
 
 AgentConnectionManager::~AgentConnectionManager()
 {
+    mIsRunning = false;
     m_Agent->deregisterMemory(mRegMemDescs);
 }
+
+bool AgentConnectionManager::isRunning() const
+{
+    return mIsRunning;
+}
+
 } // namespace tensorrt_llm::executor::kv_cache

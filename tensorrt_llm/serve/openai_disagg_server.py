@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import signal
+import socket
 import traceback
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
@@ -32,15 +33,18 @@ from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs)
+                                              get_ctx_gen_server_addrs,
+                                              get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                create_cluster_storage)
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, create_cluster_storage,
+    validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
+                                                UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -56,20 +60,19 @@ class RawRequestResponseHooks(ResponseHooks):
         self.raw_req = raw_req
         self.ctx_server = ""
         self.gen_server = ""
+        self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
-        ...
+        self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
-        logger.debug(f"Received context response from {ctx_server} for request {response.choices[0].disaggregated_params.ctx_request_id}")
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
-        logger.debug(f"Received first token from {gen_server} for request {request.disaggregated_params.ctx_request_id}")
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         if request.disaggregated_params:
@@ -78,6 +81,12 @@ class RawRequestResponseHooks(ResponseHooks):
 
 
 class OpenAIDisaggServer:
+    _CONVERSATION_ID_HEADERS = (
+        "x-session-id",
+        "x-correlation-id",
+        "x-session-affinity",
+        "x-multi-turn-session-id",
+    )
 
     def __init__(self,
                  config: DisaggServerConfig,
@@ -92,12 +101,18 @@ class OpenAIDisaggServer:
         self._metrics_interval_secs = metrics_interval_secs
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
-        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg))
-        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg))
+        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
+        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
+        self._disagg_cluster_storage = None
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname)
+            self._disagg_cluster_storage = create_cluster_storage(
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name)
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._ctx_router, self._gen_router, self._create_client,
@@ -121,8 +136,10 @@ class OpenAIDisaggServer:
 
         @asynccontextmanager
         async def lifespan(app) -> None:
+            # Prepare servers (sync server clock) when static ctx/gen server list is used
+            await self._ctx_router.prepare_servers()
+            await self._gen_router.prepare_servers()
             await self._service.setup()
-            await self._set_steady_clock_offsets()
             yield
             await self._service.teardown()
 
@@ -132,12 +149,16 @@ class OpenAIDisaggServer:
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            self._perf_metrics_collector.validation_exceptions.inc()
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
-        client = OpenAIHttpClient(router, role, self._req_timeout_secs, max_retries)
+        node_id = self._config.node_id
+        client = OpenAIHttpClient(
+            router, role, self._req_timeout_secs, max_retries,
+            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
         self._perf_metrics_collector.add_client(client)
         return client
 
@@ -154,11 +175,53 @@ class OpenAIDisaggServer:
         if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
             self._disagg_cluster_storage.add_routes(self.app)
 
+    @staticmethod
+    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
+        """Populate conversation_id from supported session headers.
+
+        When not already set in the request body, copies the header value
+        into ``disaggregated_params.conversation_id``.
+
+        Supported headers are checked in priority order: ``X-Session-ID``,
+        ``X-Correlation-ID``, ``x-session-affinity``, and
+        ``x-multi-turn-session-id``.  We mirror these conventions so the
+        ConversationRouter can provide session affinity without requiring
+        clients to set the body field.
+
+        When ``disaggregated_params`` is ``None`` (standard OpenAI
+        requests without disagg fields), a minimal instance is created
+        to carry the conversation_id.  The service layer always rebuilds
+        ``disaggregated_params`` in ``_get_ctx_request`` /
+        ``_get_gen_request`` before forwarding to workers.
+        """
+        header_conv_id = None
+        for header_name in OpenAIDisaggServer._CONVERSATION_ID_HEADERS:
+            header_conv_id = raw_req.headers.get(header_name)
+            if header_conv_id is not None and header_conv_id.strip():
+                break
+        else:
+            return
+
+        if req.disaggregated_params is None:
+            req.disaggregated_params = DisaggregatedParams(
+                request_type="context_only",
+                conversation_id=header_conv_id,
+            )
+        elif req.disaggregated_params.conversation_id is None:
+            req.disaggregated_params.conversation_id = header_conv_id
+
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
             try:
+                self._perf_metrics_collector.total_requests.inc()
+                if req.stream:
+                    self._perf_metrics_collector.stream_requests.inc()
+                else:
+                    self._perf_metrics_collector.nonstream_requests.inc()
+                self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)
+                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
                 else:
@@ -172,9 +235,11 @@ class OpenAIDisaggServer:
             logger.error("CppExecutorError: ", traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
+            self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
         else:
+            self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
@@ -190,21 +255,20 @@ class OpenAIDisaggServer:
     async def version(self) -> JSONResponse:
         return JSONResponse(content={"version": VERSION})
 
-    async def __call__(self, host: str, port: int):
+    async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+        await uvicorn.Server(config).serve(sockets=sockets)
 
-    # TODO: rework this for service discovery, now it's only for static server list
-    async def _set_steady_clock_offsets(self):
-        STEADY_CLOCK_OFFSET_ENDPOINT = "/steady_clock_offset"
+    async def _sync_server_clock(self, server: str):
+        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()
-                async with session.get(server_url + STEADY_CLOCK_OFFSET_ENDPOINT) as response:
+                async with session.get(server_url) as response:
                     destination_ts = get_steady_clock_now_in_seconds()
                     if response.status == 200:
                         response_content = await response.json()
@@ -221,12 +285,11 @@ class OpenAIDisaggServer:
 
         async def set_steady_clock_offset(session: aiohttp.ClientSession, server_url: str, offset: float) -> None:
             payload = {"offset": offset}
-            async with session.post(server_url + STEADY_CLOCK_OFFSET_ENDPOINT, json=payload) as response:
+            async with session.post(server_url, json=payload) as response:
                 if response.status != 200:
                     logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
 
         async def align_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> None:
-            server_url = f"http://{server_url}" if not server_url.startswith("http://") else server_url
             delay, offset = await query_steady_clock_offset(session, server_url)
             if delay is None or offset is None:
                 logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
@@ -235,7 +298,13 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
-            timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
-            await asyncio.gather(*[align_steady_clock_offset(session, server_url) for server_url in self._ctx_servers + self._gen_servers])
+        server_scheme = "http://" if not server.startswith("http://") else ""
+        server_url = f"{server_scheme}{server}/steady_clock_offset"
+
+        try:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
+                timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
+                await align_steady_clock_offset(session, server_url)
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(f"Unable to align steady clock offset for {server_url}: {e}; skipping adjustment")

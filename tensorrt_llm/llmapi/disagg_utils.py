@@ -1,10 +1,14 @@
 import logging
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
+from mpi4py.util import pkl5
 
 from .._utils import global_mpi_rank, global_mpi_size
 
@@ -13,6 +17,9 @@ __all__ = [
     'parse_disagg_config_file',
     'extract_server_configs',
     'split_world_comm',
+    'get_usage_tokens_from_ctx',
+    'rewrite_usage_info_from_ctx',
+    'rewrite_usage_response_from_ctx',
 ]
 
 
@@ -20,6 +27,7 @@ class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
+    VISUAL_GEN = 3
 
 
 @dataclass
@@ -76,6 +84,11 @@ class DisaggServerConfig():
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
+    node_id: int = uuid.getnode(
+    ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
+    # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    schedule_style: Literal['context_first',
+                            'generation_first'] = 'context_first'
 
 
 @dataclass
@@ -85,6 +98,40 @@ class MetadataServerConfig():
     port: int = 2379
     health_check_timeout: float = 5.0
     refresh_interval: float = 10.0
+
+
+def get_usage_tokens_from_ctx(
+        ctx_usage: Optional[Any]) -> tuple[Optional[int], int]:
+    if ctx_usage is None:
+        return None, 0
+
+    prompt_tokens = ctx_usage.prompt_tokens
+    cached_tokens = 0
+    prompt_tokens_details = ctx_usage.prompt_tokens_details
+    if prompt_tokens_details is not None:
+        cached_tokens = prompt_tokens_details.cached_tokens
+    return prompt_tokens, cached_tokens
+
+
+def rewrite_usage_info_from_ctx(usage: Optional[Any],
+                                ctx_usage: Optional[Any]) -> Optional[Any]:
+    prompt_tokens, cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
+    if prompt_tokens is None or usage is None:
+        return usage
+
+    from tensorrt_llm.serve.openai_protocol import PromptTokensDetails
+
+    usage.prompt_tokens = prompt_tokens
+    usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)
+    usage.prompt_tokens_details = PromptTokensDetails(
+        cached_tokens=cached_tokens)
+    return usage
+
+
+def rewrite_usage_response_from_ctx(response: Any,
+                                    ctx_usage: Optional[Any]) -> Any:
+    rewrite_usage_info_from_ctx(response.usage, ctx_usage)
+    return response
 
 
 def get_ctx_gen_server_addrs(
@@ -121,6 +168,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        conditional_disagg_config: Optional[dict] = None,
                        otlp_config: Optional[dict] = None,
                        disagg_cluster: Optional[dict] = None,
+                       node_id: Optional[int] = None,
+                       schedule_style: Literal[
+                           'context_first',
+                           'generation_first'] = 'context_first',
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -164,7 +215,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                                 conditional_disagg_config, otlp_config,
                                 max_retries, perf_metrics_max_requests,
                                 disagg_cluster_config)
-
+    if node_id is not None:
+        config.node_id = node_id
+    if schedule_style:
+        config.schedule_style = schedule_style
     return config
 
 
@@ -319,7 +373,7 @@ def split_world_comm(
         f"global_rank: {global_rank}, instance_idx: {instance_idx}, sub_rank: {sub_rank}, is_leader: {is_leader}"
     )
 
-    return is_leader, instance_idx, sub_comm
+    return is_leader, instance_idx, pkl5.Intracomm(sub_comm)
 
 
 def parse_metadata_server_config_file(
@@ -331,3 +385,48 @@ def parse_metadata_server_config_file(
     with open(metadata_server_config_file, 'r') as file:
         config = yaml.safe_load(file)
         return MetadataServerConfig(**config)
+
+
+MIN_GLOBAL_ID = 1 << 42
+
+# Consider GIL being removed in the future, use a lock to protect the counter
+_global_disagg_request_id_lock = threading.Lock()
+_global_disagg_request_id_counter = 0
+
+
+def get_global_disagg_request_id(machine_id: int) -> int:
+    """
+    a snowflake global disagg request id that doesn't guarantee monotonicity
+    0: positive integer
+    1-41  41 bits: timestamp_ms
+    42-51 10 bits: machine_id
+    52-63 12 bits: counter
+    """
+    global _global_disagg_request_id_lock
+    global _global_disagg_request_id_counter
+
+    COUNTER_BITS = 12
+    MACHINE_ID_BITS = 10
+    COUNTER_MASK = (1 << COUNTER_BITS) - 1
+    MAX_INT64 = (1 << 63) - 1
+
+    if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
+        raise ValueError(
+            f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
+
+    timestamp_ms = int(time.monotonic() * 1000)
+    with _global_disagg_request_id_lock:
+        counter = _global_disagg_request_id_counter & COUNTER_MASK
+        _global_disagg_request_id_counter += 1
+
+    # Rotate in [MIN_GLOBAL_ID, MAX_INT64)
+    # [0, MIN_GLOBAL_ID) is reserved for local ids
+    global_id = (timestamp_ms << (MACHINE_ID_BITS + COUNTER_BITS)) | (
+        machine_id << COUNTER_BITS) | counter
+    global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
+    return global_id_int64
+
+
+def get_local_request_id(last_id: int) -> int:
+    """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
+    return (last_id + 1) & (MIN_GLOBAL_ID - 1)

@@ -16,21 +16,25 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #if ENABLE_MULTI_DEVICE
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/extension.h>
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -40,62 +44,25 @@
 
 #if ENABLE_MULTI_DEVICE
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
+// TLLM_NCCL_CHECK (throw on failure) is provided by multiDeviceUtils.h.
 
-namespace tensorrt_llm::common::nccl_util
+// Warn-only variant: log a warning on NCCL failure but do not throw or abort.
+// Use for cleanup/secondary operations where an NCCL error is non-fatal (e.g. ncclMemFree on an error path).
+#define TLLM_NCCL_CHECK_WARN(cmd)                                                                                      \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ncclResult_t const _tllm_nccl_warn_r = (cmd);                                                                  \
+        if (TLLM_UNLIKELY(_tllm_nccl_warn_r != ncclSuccess))                                                           \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "NCCL error in %s (%s:%d): %s", #cmd, __FILE__, __LINE__, ncclGetErrorString(_tllm_nccl_warn_r));      \
+        }                                                                                                              \
+    } while (0)
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::nccl_util
 {
-
-//==============================================================================
-// NCCL Helper - Dynamic Library Loading
-//==============================================================================
-
-// Helper class for dynamically loading NCCL symbols (ncclMemAlloc, ncclCommWindowRegister)
-// This allows the code to work with NCCL libraries that may or may not have these symbols
-class NCCLHelper
-{
-public:
-    static NCCLHelper& getInstance();
-
-    // Dynamic loading function type definition
-    using ncclCommWindowRegisterFunc = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
-    using ncclMemAllocFunc = ncclResult_t (*)(void**, size_t);
-
-    // Get function pointer for ncclCommWindowRegister
-    ncclCommWindowRegisterFunc getNCCLCommWindowRegister();
-
-    // Get function pointer for ncclMemAlloc
-    ncclMemAllocFunc getNCCLMemAlloc();
-
-    // Check if NCCL library is successfully loaded
-    bool isLoaded() const;
-
-    NCCLHelper(NCCLHelper const&) = delete;
-    NCCLHelper& operator=(NCCLHelper const&) = delete;
-    NCCLHelper(NCCLHelper&&) = delete;
-    NCCLHelper& operator=(NCCLHelper&&) = delete;
-
-private:
-    NCCLHelper();
-    ~NCCLHelper();
-
-    void loadNCCLLibrary();
-    void* loadLibraryHandle(char const* libName);
-    void* getSymbolAddress(void* handle, char const* symbolName);
-
-#ifdef _WIN32
-    HMODULE mLibraryHandle;
-#else
-    void* mLibraryHandle;
-#endif
-
-    ncclCommWindowRegisterFunc mNCCLCommWindowRegister;
-    ncclMemAllocFunc mNCCLMemAlloc;
-    bool mIsLoaded;
-};
 
 //==============================================================================
 // NCCL Resource Management
@@ -136,12 +103,13 @@ public:
 
 private:
     NcclCommResourceManager() = default;
-    ~NcclCommResourceManager() = default;
+    ~NcclCommResourceManager();
 
     using ResourceEntry = std::pair<ResourceCleanupFunc, std::string>;
 
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<ResourceEntry>> mCommResources;
+    std::atomic<bool> mIsDestroying{false};
 };
 
 // RAII helper to register a resource with a NCCL communicator.
@@ -193,8 +161,30 @@ private:
 };
 
 //==============================================================================
+// NCCL Version Check
+//==============================================================================
+
+// Returns true if the compile-time and runtime NCCL versions support window buffers
+// (ncclMemAlloc / ncclCommWindowRegister).
+inline bool isNcclWindowSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int version = 0;
+    if (ncclGetVersion(&version) != ncclSuccess)
+    {
+        return false;
+    }
+    return version >= NCCL_VERSION(2, 28, 0);
+#else
+    return false;
+#endif
+}
+
+//==============================================================================
 // NCCL Window Buffer Allocation
 //==============================================================================
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 // Represents a buffer with an associated NCCL window
 struct NCCLWindowBuffer
@@ -305,17 +295,21 @@ private:
 class ScopedNCCLWindowBuffer
 {
 public:
-    ScopedNCCLWindowBuffer(ncclComm_t comm, size_t size)
-        : mComm(comm)
-        , mBuffer(NCCLWindowAllocator::getInstance().requestBuffer(comm, size))
+    ScopedNCCLWindowBuffer(std::shared_ptr<ncclComm_t> comm, size_t size)
+        : mComm(std::move(comm))
+        , mBuffer{}
     {
+        if (mComm && *mComm)
+        {
+            mBuffer = NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size);
+        }
     }
 
     ~ScopedNCCLWindowBuffer()
     {
         if (mBuffer.isValid())
         {
-            NCCLWindowAllocator::getInstance().releaseBuffer(mComm, mBuffer.ptr);
+            NCCLWindowAllocator::getInstance().releaseBuffer(*mComm, mBuffer.ptr);
         }
     }
 
@@ -345,7 +339,7 @@ public:
     ScopedNCCLWindowBuffer& operator=(ScopedNCCLWindowBuffer&&) = delete;
 
 private:
-    ncclComm_t mComm;
+    std::shared_ptr<ncclComm_t> mComm;
     NCCLWindowBuffer mBuffer;
 };
 
@@ -353,7 +347,7 @@ private:
 // The tensor will automatically release the buffer back to the pool when destroyed.
 // This is analogous to torch_ext::create_userbuffers_tensor() but for NCCLWindowAllocator.
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
-    ncclComm_t comm, at::IntArrayRef shape, torch::ScalarType dtype)
+    std::shared_ptr<ncclComm_t> comm, at::IntArrayRef shape, torch::ScalarType dtype)
 {
     // Calculate buffer size
     int64_t buffer_size
@@ -372,19 +366,33 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     // Request buffer from allocator
     auto& allocator = NCCLWindowAllocator::getInstance();
-    auto buffer = allocator.requestBuffer(comm, buffer_size);
+    NCCLWindowBuffer buffer;
+
+    if (!comm || !*comm)
+    {
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] null comm; returning invalid buffer");
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
+    }
+
+    try
+    {
+        buffer = allocator.requestBuffer(*comm, buffer_size);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
+    }
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())
     {
-        std::ostringstream oss;
-        oss << "Failed to allocate NCCL window buffer: invalid buffer returned from requestBuffer "
-            << "(comm=" << static_cast<void*>(comm) << ", buffer_size=" << buffer_size << ")";
-        throw std::runtime_error(oss.str());
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
     // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr); };
+    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(*comm, ptr); };
 
     // Create tensor from the buffer
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
@@ -392,6 +400,10 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     return std::make_pair(tensor, buffer);
 }
 
-} // namespace tensorrt_llm::common::nccl_util
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+
+} // namespace common::nccl_util
+
+TRTLLM_NAMESPACE_END
 
 #endif // ENABLE_MULTI_DEVICE

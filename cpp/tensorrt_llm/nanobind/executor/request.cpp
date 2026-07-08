@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -305,22 +305,42 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", loraConfigSetstate);
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
-    { return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths()); };
+    {
+        return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
+            self.getMultimodalUuids(), self.getMultimodalItemRunCuOffsets(), self.getMultimodalRunPositions(),
+            self.getMultimodalRunLengths());
+    };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4 && state.size() != 7)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
+        auto multimodalItemRunCuOffsets = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[4])
+                                                            : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunPositions = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[5])
+                                                        : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunLengths = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[6])
+                                                      : std::optional<std::vector<SizeType32>>(std::nullopt);
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
-            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]));
+            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]),
+            std::move(multimodalItemRunCuOffsets), std::move(multimodalRunPositions), std::move(multimodalRunLengths));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
-        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>>(),
-            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"))
+        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
+                 std::optional<std::vector<std::optional<std::string>>>, std::optional<std::vector<SizeType32>>,
+                 std::optional<std::vector<SizeType32>>, std::optional<std::vector<SizeType32>>>(),
+            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
+            nb::arg("multimodal_uuids") = nb::none(), nb::arg("multimodal_item_run_cu_offsets") = nb::none(),
+            nb::arg("multimodal_run_positions") = nb::none(), nb::arg("multimodal_run_lengths") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
         .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
         .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
+        .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
+        .def_prop_ro("multimodal_item_run_cu_offsets", &tle::MultimodalInput::getMultimodalItemRunCuOffsets)
+        .def_prop_ro("multimodal_run_positions", &tle::MultimodalInput::getMultimodalRunPositions)
+        .def_prop_ro("multimodal_run_lengths", &tle::MultimodalInput::getMultimodalRunLengths)
         .def("__getstate__", multimodalInputGetstate)
         .def("__setstate__", multimodalInputSetstate);
 
@@ -408,7 +428,8 @@ void initRequestBindings(nb::module_& m)
         kvCacheRetentionConfig, "TokenRangeRetentionConfig")
         .def(nb::init<SizeType32, std::optional<SizeType32>, tle::RetentionPriority,
                  std::optional<std::chrono::milliseconds>>(),
-            nb::arg("token_start"), nb::arg("token_end"), nb::arg("priority"), nb::arg("duration_ms") = nb::none())
+            nb::arg("token_start"), nb::arg("token_end").none(), nb::arg("priority"),
+            nb::arg("duration_ms") = nb::none())
         .def_rw("token_start", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenStart)
         .def_rw("token_end", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenEnd)
         .def_rw("priority", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::priority)
@@ -426,7 +447,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
-            nb::arg("directory") = nb::none())
+            nb::arg("directory") = "")
         .def_prop_ro("token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_prop_ro("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
         .def_prop_ro("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
@@ -442,14 +463,16 @@ void initRequestBindings(nb::module_& m)
         {
             auto serializedState = self.getSerializedState();
             return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(),
-                nb::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens());
+                nb::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens(), self.getCtxDpRank(),
+                self.getDisaggInfoEndpoint());
         }
-        return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(), nb::none(), self.getDraftTokens());
+        return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(), nb::none(), self.getDraftTokens(),
+            self.getCtxDpRank(), self.getDisaggInfoEndpoint());
     };
 
     auto ContextPhaseParamsSetState = [](tle::ContextPhaseParams& contextPhaseParams, nb::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid ContextPhaseParams state!");
         }
@@ -460,13 +483,15 @@ void initRequestBindings(nb::module_& m)
             new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
                 nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]),
                 std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
-                nb::cast<std::optional<VecTokens>>(state[3]));
+                nb::cast<std::optional<VecTokens>>(state[3]), nb::cast<std::optional<SizeType32>>(state[4]),
+                nb::cast<std::optional<std::string>>(state[5]));
         }
         else
         {
             new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
                 nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]),
-                nb::cast<std::optional<VecTokens>>(state[3]));
+                nb::cast<std::optional<VecTokens>>(state[3]), nb::cast<std::optional<SizeType32>>(state[4]),
+                nb::cast<std::optional<std::string>>(state[5]));
         }
     };
 
@@ -475,25 +500,35 @@ void initRequestBindings(nb::module_& m)
             "__init__",
             [](tle::ContextPhaseParams& self, VecTokens const& first_gen_tokens,
                 tle::ContextPhaseParams::RequestIdType req_id, std::optional<nb::bytes> const& opaque_state,
-                std::optional<VecTokens> const& draft_tokens)
+                std::optional<VecTokens> const& draft_tokens, std::optional<SizeType32> const& ctx_dp_rank,
+                std::optional<std::string> const& disagg_info_endpoint)
             {
                 if (opaque_state)
                 {
                     auto opaque_state_str_view
                         = std::string_view(opaque_state.value().c_str(), opaque_state.value().size());
                     new (&self) tle::ContextPhaseParams(first_gen_tokens, req_id,
-                        std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
+                        std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens,
+                        ctx_dp_rank, disagg_info_endpoint);
                 }
                 else
                 {
-                    new (&self) tle::ContextPhaseParams(first_gen_tokens, req_id, draft_tokens);
+                    new (&self) tle::ContextPhaseParams(
+                        first_gen_tokens, req_id, draft_tokens, ctx_dp_rank, disagg_info_endpoint);
                 }
             },
             nb::arg("first_gen_tokens"), nb::arg("req_id"), nb::arg("opaque_state").none(),
-            nb::arg("draft_tokens").none())
-        .def_prop_ro("first_gen_tokens", [](tle::ContextPhaseParams const& self) { return self.getFirstGenTokens(); })
-        .def_prop_ro("draft_tokens", [](tle::ContextPhaseParams const& self) { return self.getDraftTokens(); })
-        .def_prop_ro("req_id", &tle::ContextPhaseParams::getReqId)
+            nb::arg("draft_tokens").none(), nb::arg("ctx_dp_rank").none(), nb::arg("disagg_info_endpoint").none())
+        .def_prop_rw(
+            "first_gen_tokens", [](tle::ContextPhaseParams const& self) { return self.getFirstGenTokens(); },
+            [](tle::ContextPhaseParams& self, VecTokens const& tokens) { self.setFirstGenTokens(tokens); })
+        .def_prop_rw(
+            "draft_tokens", [](tle::ContextPhaseParams const& self) { return self.getDraftTokens(); },
+            [](tle::ContextPhaseParams& self, std::optional<VecTokens> const& tokens) { self.setDraftTokens(tokens); })
+        .def_prop_rw("req_id", &tle::ContextPhaseParams::getReqId, &tle::ContextPhaseParams::setReqId)
+        .def_prop_rw("ctx_dp_rank", &tle::ContextPhaseParams::getCtxDpRank, &tle::ContextPhaseParams::setCtxDpRank)
+        .def_prop_rw("disagg_info_endpoint", &tle::ContextPhaseParams::getDisaggInfoEndpoint,
+            &tle::ContextPhaseParams::setDisaggInfoEndpoint)
         .def_prop_ro("opaque_state",
             [](tle::ContextPhaseParams const& self)
             {
@@ -578,11 +613,11 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getCacheSaltID());
+            self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 34)
+        if (state.size() != 35)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -606,8 +641,8 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]),
-            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]));
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
@@ -648,7 +683,8 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
                  std::optional<tle::MillisecondsType>,          // allottedTimeMs
-                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
+                 std::optional<tle::IdType>,                    // disaggRequestId
+                 std::optional<std::string>                     // cacheSalt
                  >(),
             // clang-format off
         nb::arg("input_token_ids"),
@@ -688,8 +724,9 @@ void initRequestBindings(nb::module_& m)
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
-        nb::arg("cache_salt_id") = nb::none()
-    )             // clang-format on
+        nb::arg("disagg_request_id") = nb::none(),
+        nb::arg("cache_salt") = nb::none()
+    )                // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -731,8 +768,10 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
-        .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
+        .def_prop_rw("cache_salt", &tle::Request::getCacheSalt, &tle::Request::setCacheSalt)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
+        .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
+        .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
@@ -929,8 +968,8 @@ void initRequestBindings(nb::module_& m)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&response) tle::Response(
-            nb::cast<SizeType32>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<SizeType32>(state[2]));
+        new (&response)
+            tle::Response(nb::cast<IdType>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<IdType>(state[2]));
     };
 
     nb::class_<tle::Response>(m, "Response")

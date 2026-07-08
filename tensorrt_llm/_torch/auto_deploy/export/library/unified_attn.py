@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Patch for torch.export.export to detect and replace hf attention_interface with unified attention."""
 
 from typing import Optional
@@ -22,7 +36,7 @@ HF_ATTN_KWARGS_MAPPING = {
 
 
 def torch_attention_hf_wrapper(
-    self: torch.nn.Module,
+    module: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -39,6 +53,13 @@ def torch_attention_hf_wrapper(
     ad_attn_kwargs = {
         HF_ATTN_KWARGS_MAPPING[k]: v for k, v in kwargs.items() if k in HF_ATTN_KWARGS_MAPPING
     }
+
+    # Handle is_causal logic to match HF's SDPA behavior exactly.
+    # See: transformers.integrations.sdpa_attention.sdpa_attention_forward
+    is_causal = kwargs.get("is_causal", None)
+    if is_causal is None:
+        is_causal = getattr(module, "is_causal", True)
+    ad_attn_kwargs["is_causal"] = is_causal
 
     attn_output = torch.ops.auto_deploy.torch_attention(
         query_states,
@@ -70,6 +91,8 @@ class UnifiedAttnPatch(BaseExportPatch):
             # torch_export_to_gm is called at both export stage and attn matching stage
             # we only patch attn implementation for export stage
             if hasattr(model, "config") and hasattr(model.config, "_attn_implementation"):
+                self.original_values["model_config"] = model.config
+                self.original_values["_attn_implementation"] = model.config._attn_implementation
                 model.config._attn_implementation = "ad_unified_attn"
             return self.original_values["te.export"](model, *args, **kwargs)
 
@@ -79,3 +102,12 @@ class UnifiedAttnPatch(BaseExportPatch):
     def _revert_patch(self):
         """Revert the te.export patch."""
         te.export = self.original_values["te.export"]
+
+        # Restore original _attn_implementation if we modified it
+        if (
+            "model_config" in self.original_values
+            and "_attn_implementation" in self.original_values
+        ):
+            self.original_values["model_config"]._attn_implementation = self.original_values[
+                "_attn_implementation"
+            ]

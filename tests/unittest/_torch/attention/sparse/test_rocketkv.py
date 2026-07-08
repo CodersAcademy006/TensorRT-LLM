@@ -8,6 +8,7 @@ from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketKVCacheManager, RocketTrtllmAttention, RocketTrtllmAttentionMetadata,
     RocketVanillaAttention, RocketVanillaAttentionMetadata)
@@ -61,7 +62,7 @@ def test_model(backend, model_name, attention_backend):
     current_file = os.path.abspath(__file__)
     current_dir = os.path.dirname(os.path.dirname(
         os.path.dirname(current_file)))
-    input_file = f'{current_dir}/multi_gpu/test_star_attention_input.jsonl'
+    input_file = f'{current_dir}/multi_gpu/NIAH_simple_data.jsonl'
     with open(input_file, 'r') as f:
         for line in f:
             sample = json.loads(line)
@@ -258,9 +259,10 @@ def test_sparse_kv_predict(batch_size, num_contexts):
     qkv = torch.randn(total_tokens, (num_heads + 2 * num_kv_heads) * head_dim,
                       dtype=dtype,
                       device=device)
+    forward_args = AttentionForwardArgs()
 
     trtllm_sparse_kv_indices, trtllm_sparse_kv_offsets = trtllm_attn.sparse_kv_predict(
-        qkv, None, trtllm_metadata)
+        qkv, None, trtllm_metadata, forward_args)
 
     vanilla_sparse_kv_indices_list = []
     offset = 0
@@ -523,8 +525,10 @@ def test_sparse_attn_predict(batch_size, num_contexts):
 
                 kt_token_idx += kt_tokens_in_this_block
 
-    trtllm_sparse_attn_indices, trtllm_sparse_attn_offsets = trtllm_attn.sparse_attn_predict(
-        qkv, None, trtllm_metadata)
+    forward_args = AttentionForwardArgs()
+    trtllm_sparse_attn_indices, trtllm_sparse_attn_offsets = (
+        trtllm_attn.sparse_attn_predict(qkv, None, trtllm_metadata,
+                                        forward_args))
 
     vanilla_sparse_attn_indices_list = []
     offset = sum(seq_lens[:num_contexts])  # Skip context tokens

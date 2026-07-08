@@ -50,7 +50,7 @@ Note:
 * The command also maps port **8000** from the container to your host so you can access the LLM API endpoint from your host
 * See the [https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) for all the available containers. The containers published in the main branch weekly have “rcN” suffix, while the monthly release with QA tests has no “rcN” suffix. Use the rc release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html)
 
 ### Recommended Performance Settings
 
@@ -58,7 +58,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/llama-3.3-70b.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/llama-3.3-70b.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -66,7 +66,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/llama-3.3-70b.yaml
+```{literalinclude} ../../../examples/configs/curated/llama-3.3-70b.yaml
 ---
 language: shell
 prepend: |
@@ -83,7 +83,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
 
 ```shell
-trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -92,7 +92,7 @@ After the server is set up, the client can now send prompt requests to the serve
 
 <!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
 
 #### `tensor_parallel_size`
 
@@ -170,7 +170,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 &emsp;**Default**: TRTLLM
 
-See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the `extra_llm_api_options`.
+See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the YAML configuration file.
 
 ## Testing API Endpoint
 
@@ -244,7 +244,7 @@ Sample result in Blackwell.
 
 FP4 command for GSM8K
 
-* Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for LLama 3.3 70B instruction model. So set add\_special\_tokens=False to avoid it.
+* Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for Llama 3.3 70B instruction model. So set add\_special\_tokens=False to avoid it.
 
 ```shell
 MODEL_PATH=nvidia/Llama-3.3-70B-Instruct-FP4
@@ -263,7 +263,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh

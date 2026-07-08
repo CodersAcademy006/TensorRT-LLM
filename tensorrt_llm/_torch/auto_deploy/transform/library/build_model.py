@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """A simple wrapper transform to build a model via the model factory."""
 
 from typing import Tuple, Type
@@ -45,6 +59,9 @@ class BuildModel(BaseTransform):
     ) -> Tuple[nn.Module, TransformInfo]:
         # build the model
         model = factory.build_model(self.config.device)
+
+        # update the kv cache config
+        cm.update_kv_cache_config(**factory.get_cache_config_updates())
 
         # by convention, we say the model is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

@@ -21,7 +21,10 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(SRCS
     allocateKvCache.cpp
     assignReqSeqSlots.cpp
+    baseTransBuffer.cpp
+    blockKey.cpp
     cacheFormatter.cpp
+    cacheTransferLayer.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp
@@ -36,6 +39,8 @@ set(SRCS
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
+    kvCacheManagerV2Utils.cpp
+    kvCacheManagerV2Utils.cu
     llmRequest.cpp
     logitsPostProcessor.cpp
     loraBuffers.cpp
@@ -47,6 +52,8 @@ set(SRCS
     promptTuningBuffers.cpp
     rnnStateBuffers.cpp
     rnnStateManager.cpp
+    rnnCacheFormatter.cpp
+    rnnCacheTransBuffer.cpp
     runtimeBuffers.cpp
     sequenceSlotManager.cpp
     transformerBuffers.cpp
@@ -58,7 +65,8 @@ set(SRCS
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
-    cacheTransBuffer.cpp)
+    cacheTransBuffer.cpp
+    agentTree.cpp)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")

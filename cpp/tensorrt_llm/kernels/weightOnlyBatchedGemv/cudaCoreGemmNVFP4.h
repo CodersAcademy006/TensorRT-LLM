@@ -16,6 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -35,8 +36,8 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cuda_core_gemm_nvfp4
@@ -55,11 +56,13 @@ struct Params
     __nv_fp8_e4m3 const* scale_a;
     __nv_fp8_e4m3 const* scale_b;
     float const* alpha_ptr;
+    // Optional per-N bias broadcast: shape [n], same dtype as output. May be nullptr.
+    void const* bias;
 
     // used by torch flow
     Params(void const* _act, void const* _weight, void* _output, SizeType32 _m, SizeType32 _n, SizeType32 _k,
         __nv_fp8_e4m3 const* _scale_a, __nv_fp8_e4m3 const* _scale_b, cudaDataType_t _inputType,
-        cudaDataType_t _outputType, float const* _alpha_ptr)
+        cudaDataType_t _outputType, float const* _alpha_ptr, void const* _bias = nullptr)
         : act(_act)
         , weight(_weight)
         , output(_output)
@@ -71,6 +74,7 @@ struct Params
         , scale_a(_scale_a)
         , scale_b(_scale_b)
         , alpha_ptr(_alpha_ptr)
+        , bias(_bias)
     {
     }
 };
@@ -78,4 +82,5 @@ struct Params
 bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream);
 } // namespace cuda_core_gemm_nvfp4
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

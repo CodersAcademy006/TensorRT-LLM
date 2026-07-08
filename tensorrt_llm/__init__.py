@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +61,43 @@ def _preload_python_lib():
 _preload_python_lib()
 
 import sys
+from pathlib import Path
+
+
+def _setup_vendored_triton_kernels():
+    """Ensure our vendored triton_kernels takes precedence over any existing installation.
+
+    Some environments bundle triton_kernels, which can conflict with our vendored version. This function:
+    1. Clears any pre-loaded triton_kernels from sys.modules
+    2. Temporarily adds our package root to sys.path
+    3. Imports triton_kernels (caching our version in sys.modules)
+    4. Removes the package root from sys.path
+    """
+
+    # Clear any pre-loaded triton_kernels from cache
+    for mod in list(sys.modules.keys()):
+        if mod == "triton_kernels" or mod.startswith("triton_kernels."):
+            del sys.modules[mod]
+
+    # Temporarily add our package root to sys.path
+    root = Path(__file__).parent.parent
+
+    vendored = root / "triton_kernels"
+    if not vendored.exists():
+        raise RuntimeError(
+            f"Vendored triton_kernels module not found at {vendored}")
+
+    should_add_to_path = str(root) not in sys.path
+    if should_add_to_path:
+        sys.path.insert(0, str(root))
+
+    import triton_kernels  # noqa: F401
+
+    if should_add_to_path:
+        sys.path.remove(str(root))
+
+
+_setup_vendored_triton_kernels()
 
 # Need to import torch before tensorrt_llm library, otherwise some shared binary files
 # cannot be found for the public PyTorch, raising errors like:
@@ -84,7 +121,7 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, MultimodalEncoder
+from .llmapi import LLM, AsyncLLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -95,6 +132,9 @@ from .parameter import Parameter
 from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
+from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
+                         VisualGenMetrics, VisualGenOutput, VisualGenParams,
+                         VisualGenResult)
 
 __all__ = [
     'AutoConfig',
@@ -136,14 +176,22 @@ __all__ = [
     'quantization',
     'tools',
     'LLM',
+    'AsyncLLM',
     'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
     'SamplingParams',
+    'VisualGenArgs',
+    'ExtraParamSchema',
+    'VisualGenMetrics',
+    'VisualGenOutput',
+    'VisualGenResult',
     'DisaggregatedParams',
     'KvCacheConfig',
     'math_utils',
+    'VisualGen',
+    'VisualGenParams',
     '__version__',
 ]
 

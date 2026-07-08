@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@
 #include "cutlass_extensions/epilogue/fusion/sm90_visitor_scatter.hpp"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
@@ -54,9 +55,10 @@
 #include <cuda_fp8.h>
 #include <math.h>
 #include <sstream>
+#include <type_traits>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -585,7 +587,8 @@ using namespace cutlass::epilogue;
                 }                                                                                                                                                                                                                                                                                                           \
             }();                                                                                                                                                                                                                                                                                                            \
             using EpilogueArguments = typename CollectiveEpilogue::Arguments;                                                                                                                                                                                                                                               \
-            using EpilogueScalars = decltype(EpilogueArguments{}.thread);                                                                                                                                                                                                                                                   \
+            using EpilogueScalars = typename std::remove_cv<                                                                                                                                                                                                                                                                \
+                typename std::remove_reference<decltype(EpilogueArguments{}.thread)>::type>::type;                                                                                                                                                                                                                          \
             EpilogueScalars epilogue_scalars = [&]                                                                                                                                                                                                                                                                          \
             {                                                                                                                                                                                                                                                                                                               \
                 constexpr bool IsSimpleAlphaBeta                                                                                                                                                                                                                                                                            \
@@ -709,4 +712,5 @@ using namespace cutlass::epilogue;
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

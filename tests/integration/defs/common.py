@@ -15,6 +15,7 @@
 import copy
 import os
 import platform
+import random
 import re
 import socket
 import tempfile
@@ -32,7 +33,8 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .trt_test_alternative import check_call, check_output, exists, is_windows
+from .trt_test_alternative import (check_call, check_output, exists, is_windows,
+                                   print_info, print_warning)
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):
@@ -52,6 +54,15 @@ def venv_check_output(venv, cmd, env=None, **kwargs):
         return output
 
     return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
+
+
+def resolve_llm_model_path(model_path: str) -> str:
+    """Resolve a model subpath relative to the test LLM model root."""
+    if os.path.isabs(model_path):
+        return model_path
+
+    from .conftest import llm_models_root
+    return os.path.join(llm_models_root(), model_path)
 
 
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd, **kwargs):
@@ -301,7 +312,7 @@ def convert_weights(llm_venv,
                 "--use_weight_only", "--weight_only_precision=int4_awq",
                 "--group_size=128"
             ])
-        if 'hf_fp8' in model:
+        if 'finegrained_fp8' in model:
             convert_cmd.extend(["--use_fp8"])
 
     elif "draft_target_model" in model:
@@ -930,12 +941,16 @@ def test_llm_torch_multi_lora_support(
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
         tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        expected_outputs=None):
-    """Test multi-LoRA support with LLM-API Torch backend."""
+        pipeline_parallel_size=1):
+    """Test multi-LoRA support with LLM-API Torch backend.
 
-    # if expected_outputs is None:
-    #     raise ValueError("expected_outputs must be provided for exact validation")
+    When zero_lora_weights=True, validates that LoRA outputs match base model
+    outputs (since zero-weight LoRAs should not alter behavior).
+    """
+
+    assert zero_lora_weights, (
+        "This test compares LoRA outputs against base model outputs, "
+        "which is only valid when zero_lora_weights=True.")
 
     start_time = time.time()
     print("Creating dummy LoRAs...")
@@ -953,9 +968,6 @@ def test_llm_torch_multi_lora_support(
         f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
     )
 
-    print("Initializing LLM_torch with LoRA support...")
-    init_start = time.time()
-
     lora_config = LoraConfig(lora_dir=lora_paths,
                              max_lora_rank=lora_rank,
                              max_loras=num_loras,
@@ -964,17 +976,57 @@ def test_llm_torch_multi_lora_support(
 
     input_prompts = get_test_prompts_for_torch()
 
-    with LLM_torch(
-            model=hf_model_dir,
-            lora_config=lora_config,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
-            dtype="bfloat16",
-            max_batch_size=8,  # From original test
-            max_input_len=512,  # From original test
-            max_seq_len=562,  # From original test
-            max_beam_width=1  # From original test
-    ) as llm:
+    sampling_params = SamplingParams(max_tokens=30,
+                                     top_p=0.5,
+                                     top_k=0,
+                                     temperature=0.0)
+
+    # Step 1: Get base model outputs (no LoRA) as the ground truth.
+    print("Initializing LLM_torch without LoRA for base model outputs...")
+    init_start = time.time()
+
+    with LLM_torch(model=hf_model_dir,
+                   tensor_parallel_size=tensor_parallel_size,
+                   pipeline_parallel_size=pipeline_parallel_size,
+                   dtype="bfloat16",
+                   max_batch_size=8,
+                   max_input_len=512,
+                   max_seq_len=562,
+                   max_beam_width=1) as base_llm:
+
+        init_end = time.time()
+        print(
+            f"Base LLM_torch initialization completed in {(init_end - init_start):.2f} seconds."
+        )
+
+        print("Running base model inference (no LoRA)...")
+        base_inference_start = time.time()
+
+        base_outputs = base_llm.generate(input_prompts,
+                                         sampling_params=sampling_params)
+
+        base_inference_end = time.time()
+        print(
+            f"Base inference completed in {(base_inference_end - base_inference_start):.2f} seconds."
+        )
+
+    expected_outputs = [o.outputs[0].text for o in base_outputs]
+    for i, text in enumerate(expected_outputs):
+        print(f"Base output {i+1}: {text!r}")
+
+    # Step 2: Run with LoRA adapters and compare against base outputs.
+    print("Initializing LLM_torch with LoRA support...")
+    init_start = time.time()
+
+    with LLM_torch(model=hf_model_dir,
+                   lora_config=lora_config,
+                   tensor_parallel_size=tensor_parallel_size,
+                   pipeline_parallel_size=pipeline_parallel_size,
+                   dtype="bfloat16",
+                   max_batch_size=8,
+                   max_input_len=512,
+                   max_seq_len=562,
+                   max_beam_width=1) as llm:
 
         init_end = time.time()
         print(
@@ -984,20 +1036,18 @@ def test_llm_torch_multi_lora_support(
         print("Running inference with LLM-API Torch backend...")
         inference_start = time.time()
 
-        # Create LoRA requests for different adapters
+        # Create LoRA requests cycling through available adapters.
         lora_requests = []
+        lora_counter = 0
         for i in range(len(input_prompts)):
-            if i % 2 == 1:  # Add some requests without LoRA
+            if i % 2 == 1:
                 lora_requests.append(None)
-            else:  # With LoRA
+            else:
+                lora_idx = lora_counter % num_loras
+                lora_counter += 1
                 lora_requests.append(
-                    LoRARequest(f"lora-{i}", i,
-                                lora_paths[i % len(lora_paths)]))
-
-        sampling_params = SamplingParams(max_tokens=30,
-                                         top_p=0.5,
-                                         top_k=0,
-                                         temperature=0.0)
+                    LoRARequest(f"lora-{lora_idx}", lora_idx,
+                                lora_paths[lora_idx]))
 
         outputs = llm.generate(input_prompts,
                                sampling_params=sampling_params,
@@ -1008,8 +1058,8 @@ def test_llm_torch_multi_lora_support(
             f"Inference completed in {(inference_end - inference_start):.2f} seconds."
         )
 
-        # Validate exact outputs
-        print("Validating exact outputs...")
+        # Validate that LoRA outputs match base model outputs.
+        print("Validating outputs against base model...")
         assert len(outputs) == len(expected_outputs), \
             f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
 
@@ -1019,13 +1069,12 @@ def test_llm_torch_multi_lora_support(
             print(
                 f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}"
             )
-            print(f"Expected: {expected}")
-            print(f"Actual: {actual_text}")
+            print(f"Expected (base): {expected!r}")
+            print(f"Actual (LoRA):   {actual_text!r}")
             print("-" * 50)
 
-            # Exact string comparison
             assert actual_text == expected, \
-                f"Output {i+1} mismatch:\nExpected: {expected!r}\nActual: {actual_text!r}"
+                f"Output {i+1} mismatch:\nExpected (base): {expected!r}\nActual (LoRA):   {actual_text!r}"
 
     total_time = time.time() - start_time
     print(f"Total test execution time: {total_time:.2f} seconds")
@@ -1153,17 +1202,62 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
+PORTS_IN_USE = set()
+
+
+def get_free_port_in_ci(max_attempts=100):
+    """
+    Get a free port in the range [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1]
+    If CONTAINER_PORT_START and CONTAINER_PORT_NUM are not set or all ports are already in use, fallback to get_free_port
+    """
+    global PORTS_IN_USE
+
+    container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
+    container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
+    if container_port_start != -1 and container_port_num != -1:
+        available_ports = [
+            port for port in range(container_port_start, container_port_start +
+                                   container_port_num)
+            if port not in PORTS_IN_USE
+        ]
+
+        for _ in range(len(available_ports)):
+            # Get a random port from the available ports
+            port = random.choice(available_ports)
+
+            # Check if the port is free
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("localhost", port))
+                    PORTS_IN_USE.add(port)
+                    return port
+                except OSError:
+                    available_ports.remove(port)
+                    continue
+
+    # No port found in the range, try to get a random free port from the system
+    for _ in range(max_attempts):
+        port = get_free_port()
+        if port not in PORTS_IN_USE:
+            PORTS_IN_USE.add(port)
+            return port
+
+    raise Exception(
+        f"Failed to find a free port both in container port range and system after {max_attempts} attempts"
+    )
+
+
 def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: dict[str, Any]) -> dict[str, Any]:
     # Revise serve port
-    disaggregated_server_config['port'] = get_free_port()
+    disaggregated_server_config['port'] = get_free_port_in_ci()
 
     # Revise context and generation server urls
     ctx_urls = disaggregated_server_config["context_servers"]["urls"]
     gen_urls = disaggregated_server_config["generation_servers"]["urls"]
     url_map = dict()
     for url in set(ctx_urls + gen_urls):
-        url_map[url] = (url.split(':')[0], get_free_port())
+        url_map[url] = (url.split(':')[0], get_free_port_in_ci())
 
     for i, url in enumerate(ctx_urls):
         disaggregated_server_config["context_servers"]["urls"][
@@ -1189,3 +1283,34 @@ def revise_disagg_config_file_with_free_ports(disagg_config_file: str) -> str:
         yaml.dump(new_config, f)
 
     return new_config_file
+
+
+def parse_gsm8k_output(output_text: str) -> float:
+    """
+    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
+
+    Args:
+        output_text: The output text from gsm8k command
+
+    Returns:
+        float: The accuracy value (0.7582 in the example)
+    """
+
+    # Look for the specific pattern:
+    # |gsm8k|...|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # lm-eval pads table cells, so allow whitespace around the value.
+    patterns = [
+        r'flexible-extract\s*\|\s*\d+\s*\|\s*exact_match\s*\|\s*↑\s*\|\s*(\d+(?:\.\d+)?)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, output_text)
+        if match:
+            accuracy_value = float(match.group(1))
+            print_info(f"Extracted GSM8K accuracy value: {accuracy_value}")
+            return accuracy_value
+
+    print_warning("Could not find GSM8K accuracy value in gsm8k output")
+    print_warning(f"Output text: {output_text}")
+
+    return 0.0

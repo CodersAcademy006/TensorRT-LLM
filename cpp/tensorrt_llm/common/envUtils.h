@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +16,16 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 // Useful when you want to inject some debug code controllable with env var.
 std::optional<int32_t> getIntEnv(char const* name);
@@ -35,11 +38,6 @@ bool getBoolEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
-
-// Whether XQA JIT is enabled.
-//
-// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
-std::optional<bool> getEnvEnableXQAJIT();
 
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
@@ -56,6 +54,11 @@ int getEnvMmhaKernelBlockSize();
 
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
+
+// Whether PDL is enabled for MoE Renormalize routing kernel.
+// Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
+// Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL();
 
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
@@ -80,15 +83,18 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
 
-bool getEnvUseRoundRobinBlockDistForCP();
+bool getEnvUseMooncakeKvCache();
 
 std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();
 
 std::string getEnvNixlBackend();
+
+std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
 
@@ -135,13 +141,12 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 uint16_t getEnvNixlPort();
 
+bool getEnvNixlEnableCoalesce();
+
 bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
-
-// Whether to use one block per token for MoE A2A kernels (default true).
-bool getEnvMoeA2AOneBlockPerToken();
 
 // TODO: For DEV purpose temporarily.
 // Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
@@ -153,4 +158,8 @@ bool getEnvKVCacheTransferAllBlocksForWindow();
 
 bool getEnvEplbForceGdrcopy();
 
-} // namespace tensorrt_llm::common
+bool getEnvPrintSkipSoftmaxStat();
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

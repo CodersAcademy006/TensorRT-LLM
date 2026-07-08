@@ -30,7 +30,8 @@ slurm:
   job_time: "02:00:00"
   job_name: "<job_name>"
   extra_args: ""  # Additional SLURM arguments (e.g., "--gres=gpu:4 --exclude=node1")
-  numa_bind: true  # Enable NUMA binding for GB200 NVL72
+  set_segment: true # Optional: whether to set the segment for the job
+  numa_bind: true  # Enable NUMA binding for GB200/GB300 NVL72
 ```
 
 ### 2. Benchmark Configuration
@@ -53,7 +54,18 @@ hardware:
   gpus_per_node: 4  # GPUs per node in your cluster
   num_ctx_servers: 1  # Number of context processing servers
   num_gen_servers: 1  # Number of generation servers
+  # compact_packing: false  # Opt-in; see note below
 ```
+
+By default each worker owns whole nodes (round-robin), so cross-worker
+traffic never crosses a node boundary. Set `compact_packing: true` to pack
+all workers into `ceil(total_gpus / gpus_per_node)` nodes, allowing two
+workers to share a physical node when their GPU counts don't align with
+node boundaries (e.g. two TP=6 ctx workers fit in 3 four-GPU nodes via
+4+2 / 2+4). This is **only recommended on full-mesh NVLink fabrics like
+GB200/GB300 NVL72**, where the cross-worker NVLink traffic on the shared
+node is free; on PCIe or partitioned-NVLink hosts the shared node will
+become a bottleneck and you should leave it off.
 
 ### 4. Environment Configuration
 ```yaml
@@ -174,15 +186,16 @@ Results are automatically organized in the work directory:
 
 ### Benchmark Modes
 
-The system supports two primary benchmark modes:
+The system supports three primary benchmark modes:
 
 1. **End-to-End (e2e)**: Tests the complete disaggregated inference pipeline including both context processing and token generation phases
 2. **Generation Only (gen_only)**: Focuses solely on testing the generation phase with pre-cached KV data
+3. **Generation Only No Context (gen_only_no_context)**: Skips launching context workers entirely by setting `TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1`. This is useful when you only want to benchmark the generation phase without allocating resources for context workers.
 
 Configure the mode in the YAML file:
 ```yaml
 benchmark:
-  mode: "e2e"  # or "gen_only"
+  mode: "e2e"  # or "gen_only" or "gen_only_no_context"
 ```
 
 ### Metrics Collection

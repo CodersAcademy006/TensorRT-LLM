@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,11 +41,13 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
@@ -214,15 +216,14 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
-            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
-            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, CacheType::kSELF,
+            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dataType,
+            sinkTokenLength, stream, maxAttentionWindow, maxAttentionWindow, enableBlockReuse, CacheType::kSELF,
             std::nullopt, nullptr, true);
         auto attentionLayerNumPerPP = std::vector<SizeType32>{numLayers};
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
@@ -303,13 +304,15 @@ protected:
         bufferManagers.push_back(mCacheTransBufferManager.get());
         if (isSender)
         {
-            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
         else
         {
-            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
     }
 
@@ -330,7 +333,8 @@ protected:
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -344,11 +348,11 @@ protected:
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
             }
-            mFutures.emplace_back(mSender->sendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->sendAsync(llmRequest));
         }
         else
         {
-            auto future = mRequester->receiveAsync(*llmRequest);
+            auto future = mRequester->receiveAsync(llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -405,6 +409,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     mFutures.clear();
     for (auto& request : requests)
     {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
         mManager->removeSequence(request->mRequestId, request);
     }
     requests.clear();
@@ -443,13 +448,11 @@ struct CPMetaData
         mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
         mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(
             cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
-        mSeqLenOnThisCPRank = totalSeqLen;
+        // For round-robin distribution of blocks among CP ranks, the last block (which may have padded tokens)
+        // belongs to the CP rank with index (mTotalNumBlocksAcrossCPRanks - 1) % cpSize.
         int numPaddedTokensLastBlock = 0;
-        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(),
-            "Round-robin block distribution for CP needs further adjustments.");
-        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of
-        // blocks.
-        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0)
+        int const lastBlockOwnerCPRank = (mTotalNumBlocksAcrossCPRanks - 1) % cpSize;
+        if (cpRank == lastBlockOwnerCPRank && totalSeqLen % numTokensPerBlock != 0)
         {
             numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
         }
@@ -457,20 +460,21 @@ struct CPMetaData
         mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
         for (int i = 0; i < mNumBlocksThisCPRank; i++)
         {
-            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(
-                i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+            // Round-robin distribution: localBlockIdx i on cpRank maps to global blockId (i * cpSize + cpRank).
+            mGlobalBlockIds[i] = i * cpSize + cpRank;
         }
     }
 };
 
 struct WrappedLlmRequest
 {
-    std::unique_ptr<LlmRequest> mLlmRequest;
+    // shared_ptr to match CacheSender::sendAsync / CacheReceiver::receiveAsync signatures.
+    std::shared_ptr<LlmRequest> mLlmRequest;
     std::optional<CPMetaData> mCPMetaData;
 
     using RequestIdType = LlmRequest::RequestIdType;
 
-    WrappedLlmRequest(std::unique_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
+    WrappedLlmRequest(std::shared_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
         : mLlmRequest(std::move(llmRequest))
         , mCPMetaData(std::move(cpMetaData))
     {
@@ -551,9 +555,10 @@ protected:
                 mCpSize = genCp;
             }
 
-            mTpRank = mRankInInstance % mTpSize;
+            // Rank formula must match targetIRanks: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+            mCpRank = mRankInInstance % mCpSize;
+            mTpRank = (mRankInInstance / mCpSize) % mTpSize;
             mPpRank = mRankInInstance / (mTpSize * mCpSize);
-            mCpRank = (mRankInInstance % (mTpSize * mCpSize)) / mTpSize;
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
             mContextTpSize = contextTp;
@@ -645,7 +650,6 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
         {
@@ -685,10 +689,11 @@ protected:
         }
         TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
-            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
-            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
-            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
-            /*enableIndexerKCache=*/isIndexerKCache, /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
+            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, dataType, sinkTokenLength, stream,
+            maxAttentionWindow, maxAttentionWindow, enableBlockReuse, cacheType, std::nullopt, nullptr,
+            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
+            /*kvCacheConnectorManager=*/nullptr, /*enableIndexerKCache=*/isIndexerKCache,
+            /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
             /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
@@ -713,7 +718,7 @@ protected:
             return;
         }
         else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache()
-            || tensorrt_llm::common::getEnvUseNixlKvCache())
+            || tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache())
         {
             int maxNumTokens = 2048;
             mCacheTransBufferManagers.clear();
@@ -729,7 +734,15 @@ protected:
             }
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
-            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : isNixl ? "NIXL" : "MPI");
+            bool isMooncake = tensorrt_llm::common::getEnvUseMooncakeKvCache();
+            // Skip tests for MOONCAKE when on Rocky8
+            bool isRocky8 = std::filesystem::exists("/etc/redhat-release");
+            isMooncake = isMooncake && !isRocky8;
+            TLLM_LOG_INFO("Enable %s KV cache transport.",
+                isUcx            ? "UCX"
+                    : isNixl     ? "NIXL"
+                    : isMooncake ? "MOONCAKE"
+                                 : "MPI");
 
             if (isUcx)
             {
@@ -755,8 +768,17 @@ protected:
 
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
-                mConnectionManager
-                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(bufferManagers, *mCacheState);
+                std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
+                    bufferManagers.begin(), bufferManagers.end());
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    baseBufferManagers, *mCacheState, "nixl");
+            }
+            else if (isMooncake)
+            {
+                std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
+                    bufferManagers.begin(), bufferManagers.end());
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    baseBufferManagers, *mCacheState, "mooncake");
             }
             else
             {
@@ -771,19 +793,19 @@ protected:
             if (mIsContext)
             {
                 mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             else
             {
                 mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 
             std::vector<int> contextRankVec(mContextRankSize);
             std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
 
-            if (isUcx || isNixl)
+            if (isUcx || isNixl || isMooncake)
             {
                 auto commState = mConnectionManager->getCommState();
                 namespace su = tensorrt_llm::executor::serialize_utils;
@@ -866,14 +888,23 @@ protected:
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
+        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
     auto makeLlmRequestWithDP(SizeType32 length, LlmRequest::RequestIdType requestId, int contextDpRank)
     {
         constexpr SizeType32 maxNewTokens{1};
-        texec::Request request{VecTokens(length), maxNewTokens};
+        auto const tokensPerBlock = mContextCacheState->getModelConfig().mTokensPerBlock;
+
+        std::optional<CPMetaData> cpMetaData;
+        int seqLen = length;
+        if (mCpSize > 1)
+        {
+            cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
+            seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
+        }
+        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
@@ -889,9 +920,8 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
+        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
 
-        std::optional<CPMetaData> cpMetaData;
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -900,7 +930,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
 
         int const numPools = mManager->getBlockManager().getNumPools(
@@ -931,7 +962,7 @@ protected:
             auto indexerKCacheBlockRange = blockRange.getBlockRangeForWindow(windowSizes[0], true);
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                fillBlockData(*it, blockIdx, llmRequest->getPromptLen(), windowSizes[0], true);
+                fillBlockData(*it, blockIdx, initial, windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -943,7 +974,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mSender->sendAsync(*llmRequest);
+        auto future = mSender->sendAsync(llmRequest);
         return future;
     }
 
@@ -952,8 +983,9 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        return mRequester->receiveAsync(*llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
+        return mRequester->receiveAsync(llmRequest);
     }
 
     void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)
@@ -999,11 +1031,20 @@ protected:
         }
         if (mManager->isEnableIndexerKCache())
         {
+            size_t indexerInitial = llmRequest->getPromptLen();
+            std::vector<int> indexerGlobalBlockIds;
+            if (request->mCPMetaData.has_value())
+            {
+                auto const& cpData = request->mCPMetaData.value();
+                indexerInitial = cpData.mTotalSeqLenAcrossCPRanks;
+                indexerGlobalBlockIds = cpData.mGlobalBlockIds;
+            }
             auto indexerKCacheBlockRange = blockRange.getBlockRangeForWindow(windowSizes[0], true);
             blockIdx = 0;
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                verifyBlockData(*it, llmRequest->getPromptLen(), blockIdx, windowSizes[0], true);
+                verifyBlockData(*it, indexerInitial,
+                    indexerGlobalBlockIds.empty() ? blockIdx : indexerGlobalBlockIds[blockIdx], windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -1046,8 +1087,10 @@ protected:
         {
             TLLM_CHECK(mCacheState->getIndexerKCacheQuantBlockSize() != 0);
             TLLM_CHECK(mCacheState->getIndexerDimPerHead() % mCacheState->getIndexerKCacheQuantBlockSize() == 0);
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1140,8 +1183,10 @@ protected:
         int sizePerHead;
         if (isIndexerKCache)
         {
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1286,9 +1331,14 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     int indexerDimPerHead = std::get<17>(param);
     int indexerKCacheQuantBlockSize = std::get<18>(param);
 
-    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    if (genCp > 1 && (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache()))
     {
-        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
+    }
+    if (isIndexerKCache && tensorrt_llm::common::getEnvUseMooncakeKvCache())
+    {
+        // https://nvbugs/5760737
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
     }
     std::vector<int> lenList = {30, 10, 60, 80};
     if (genCp > 1)
@@ -1363,6 +1413,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
                 mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();
@@ -1410,10 +1461,31 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     int indexerDimPerHead = std::get<17>(param);
     int indexerKCacheQuantBlockSize = std::get<18>(param);
 
-    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    if (genCp > 1 && (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache()))
     {
-        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
+    // Filter request lengths based on CP requirements.
+    // Each request must have at least one block per CP rank to be valid for CP tests.
+    std::vector<int> lenList = {60, 30, 60, 10};
+    if (genCp > 1)
+    {
+        std::vector<int> updatedLenList;
+        for (auto len : lenList)
+        {
+            if (len > tokensPerBlock * (genCp - 1))
+            {
+                updatedLenList.push_back(len);
+            }
+        }
+        if (updatedLenList.empty())
+        {
+            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
+                         << tokensPerBlock << ", genCp=" << genCp;
+        }
+        lenList = updatedLenList;
+    }
+
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
     if (mIsContext || mIsGeneration)
@@ -1424,7 +1496,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;
-        for (auto len : {60, 30, 60, 10})
+        for (auto len : lenList)
         {
             requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
             requestId++;
@@ -1502,6 +1574,189 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
+// ---------------------------------------
+//   UnexpectedTerminationRaceTest
+// ---------------------------------------
+
+class UnexpectedTerminationRaceTest : public AsymmetricalCacheTest
+{
+};
+
+TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
+{
+    if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
+    {
+        setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
+    }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
+
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    nvinfer1::DataType dataType = std::get<10>(param);
+
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
+    int indexerDimPerHead = std::get<17>(param);
+    int indexerKCacheQuantBlockSize = std::get<18>(param);
+
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
+    if (contextDP || generationDP)
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with DP enabled.";
+    }
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    if (mIsContext || mIsGeneration)
+    {
+        bool enableDP = mIsContext ? contextDP : generationDP;
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP,
+            isWindow, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
+        setUpCacheTransceiver();
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+        int requestId = 0;
+        for (auto len : {30, 10, 60, 30, 60, 10})
+        {
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            ++requestId;
+        }
+        std::vector<std::future<void>> contextFutures;
+        std::vector<std::future<void>> generationFutures;
+        std::vector<std::shared_ptr<WrappedLlmRequest>> generationRequests;
+        size_t constexpr designatedSuccessfulRequestCount = 2;
+
+        if (mIsContext)
+        {
+            std::vector<std::shared_ptr<WrappedLlmRequest>> contextRequests;
+            if (contextDP)
+            {
+                for (size_t i = 0; i < requests.size(); ++i)
+                {
+                    if (i % mTpSize == mTpRank)
+                    {
+                        // Round robin
+                        contextRequests.push_back(requests[i]);
+                    }
+                }
+            }
+            else
+            {
+                contextRequests = requests;
+            }
+            for (auto&& request : contextRequests)
+            {
+                contextFutures.push_back(std::move(addRequestAndTransportCacheForContext(request)));
+            }
+            mComm->barrier();
+        }
+        else
+        {
+            if (generationDP)
+            {
+                for (size_t i = 0; i < requests.size(); ++i)
+                {
+                    if (i % mTpSize == mTpRank)
+                    {
+                        generationRequests.push_back(requests[i]);
+                    }
+                }
+            }
+            else
+            {
+                generationRequests = requests;
+            }
+            mComm->barrier();
+            for (auto&& request : generationRequests)
+            {
+                generationFutures.push_back(std::move(addRequestAndTransportCacheForGeneration(request)));
+            }
+        }
+        if (mIsContext)
+        {
+            for (size_t requestIndex = 0; requestIndex < contextFutures.size(); ++requestIndex)
+            {
+                contextFutures[requestIndex].get();
+                // CRITICAL: Destroy the connection manager after some sends complete
+                // This triggers the race condition on the receiver side
+                if (requestIndex == designatedSuccessfulRequestCount)
+                {
+                    TLLM_LOG_WARNING(mRank, "Context: Destroying CacheSender");
+                    try
+                    {
+                        mSender.reset();
+                        TLLM_LOG_DEBUG(mRank, "CacheSender reset");
+                        mConnectionManager.reset();
+                        TLLM_LOG_DEBUG(mRank, "ConnectionManager reset");
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR(mRank, "Error resetting mSender: %s", e.what());
+                        EXPECT_TRUE(false);
+                    }
+                    break;
+                }
+            }
+        }
+        else
+        {
+            for (size_t requestIndex = 0; requestIndex < generationFutures.size(); ++requestIndex)
+            {
+                generationFutures[requestIndex].get();
+                if (requestIndex == designatedSuccessfulRequestCount)
+                {
+                    TLLM_LOG_WARNING(mRank, "Generation: Destroying CacheReceiver");
+                    try
+                    {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        mRequester.reset();
+                        TLLM_LOG_DEBUG(mRank, "CacheReceiver reset");
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR(mRank, "Error resetting mRequester: %s", e.what());
+                        EXPECT_TRUE(false);
+                    }
+                    break;
+                }
+            }
+            for (size_t requestIndex = 0; requestIndex < designatedSuccessfulRequestCount + 1; ++requestIndex)
+            {
+                generationVerifyKVCache(generationRequests[requestIndex]);
+            }
+        }
+        mComm->barrier();
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// Test for race condition during destructor (2 context ranks, 4 generation ranks, DP disabled)
+INSTANTIATE_TEST_CASE_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest,
+    testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(0),
+        testing::Values(128)));
+
+// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
@@ -1596,7 +1851,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
@@ -1615,6 +1873,195 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP on gen side for GQA/MHA.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForGQA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2, 4),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side for GQA/MHA.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForGQA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests high context PP with TP and CP variations on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1, 2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Tests high context PP with PP and CP on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Tests high context PP with pure CP on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(4),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Tests cases where there's non-trivial DP on context side while non-trivial CP & DP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(2, 4),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(true),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side for GQA/MHA.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA0, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where there's non-trivial DP on context side while non-trivial CP & DP on gen side for GQA/MHA.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA1, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(2, 4),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(true),
+        /*generationDP*/ testing::Values(true),
         /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
@@ -1744,7 +2191,7 @@ TEST(targetTest, CacheStateNODP)
             sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -1832,16 +2279,16 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2},
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1},
             /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3},
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3},
             /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6},
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5},
             /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {5, 7},
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7},
             /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
     }
 
@@ -1850,19 +2297,19 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5},
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2, 1, 3},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 6, 3, 7},
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6, 5, 7},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {8, 12, 9, 13},
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {8, 10, 9, 11},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {10, 14, 11, 15},
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {12, 14, 13, 15},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
     }
@@ -1872,16 +2319,16 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
     }
 
@@ -1890,19 +2337,19 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 4, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 2, 6},
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5},
             /*expectPPDomain*/ 2,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 5, 3, 7},
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 6, 3, 7},
             /*expectPPDomain*/ 2,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {8, 12, 10, 14},
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {8, 12, 9, 13},
             /*expectPPDomain*/ 2,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {9, 13, 11, 15},
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {10, 14, 11, 15},
             /*expectPPDomain*/ 2,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
     }
@@ -1912,28 +2359,28 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 4, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {5, 7}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {5, 7}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
     }
 
@@ -1942,28 +2389,28 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
         verifyContext(
-            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
         verifyContext(
-            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1, 3}, /*expectPPDomain*/ 1,
+            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
     }
 
@@ -1972,19 +2419,235 @@ TEST(targetTest, CacheStateNODP)
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 2};
         verifyContext(
-            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5},
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2, 1, 3},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6, 5, 7},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2, 1, 3},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6, 5, 7},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+
+    // PP, CP grow while TP shrinks from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 1, /*ppSize*/ 2, /*cpSize*/ 4};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5, 2, 6, 3, 7},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 4, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5, 2, 6, 3, 7},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 4, /*expectNeedSend*/ false);
+    }
+}
+
+TEST(targetTest, CacheStateNODPForGQAWithCP)
+{
+
+    int const numLayers = 16;
+    int const numHeads = 4;
+    int const sizePerHead = 64;
+    int const tokensPerBlock = 64;
+    auto const dataType = nvinfer1::DataType::kFLOAT;
+    bool const isMLA = false;
+    int const kvFactor = 2;
+
+    auto const verifyContext = [&](int contextRank, tr::WorldConfig const& contextWC, tr::WorldConfig const& genWC,
+                                   std::vector<int> const& expectRanks, int expectPPDomain, int expectTPDomain,
+                                   int expectCPDomain, bool expectNeedSend)
+    {
+        auto const attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
+                                         : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
+        std::vector<SizeType32> contextAttentionLayerNumPerPP(
+            contextWC.getPipelineParallelism(), numLayers / contextWC.getPipelineParallelism());
+        std::vector<SizeType32> genAttentionLayerNumPerPP(
+            genWC.getPipelineParallelism(), numLayers / genWC.getPipelineParallelism());
+
+        auto const sharedModelConfig
+            = texec::kv_cache::CacheState::ModelConfig{std::vector(numLayers, numHeads), sizePerHead, tokensPerBlock};
+        auto const contextCache = texec::kv_cache::CacheState(
+            sharedModelConfig, contextWC, contextAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+        auto const genCache = texec::kv_cache::CacheState(
+            sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+
+        auto const contextTargetInfo
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
+
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
+        EXPECT_EQ(expectCPDomain, contextTargetInfo.mDomainCPSize);
+        EXPECT_EQ(expectNeedSend, cache_formatter_utils::needSendCache(contextCache, genCache, contextRank));
+    };
+
+    // CP grows from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1},
+            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3},
+            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5},
+            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7},
+            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+
+    // TP as well as CP grow from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2, 1, 3},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6, 5, 7},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {8, 10, 9, 11},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {12, 14, 13, 15},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+
+    // TP shrinks while CP grows from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+    }
+
+    // PP as well as CP grow from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 4, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
             /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 6, 3, 7},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {8, 12, 9, 13},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {10, 14, 11, 15},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+
+    // PP shrinks while CP grows from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 4, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+
+    // TP as well as PP shrink while CP grows from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+    }
+
+    // TP, CP grow while PP shrinks from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2, 1, 3},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5},
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6, 5, 7},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
         verifyContext(
-            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 6, 3, 7},
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 2, 1, 3},
+            /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 6, 5, 7},
             /*expectPPDomain*/ 1,
             /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
     }
@@ -2029,8 +2692,8 @@ TEST(targetTest, CacheStateContextDP)
     auto const verifyContext = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
                                    int expectPPDomain, int expectTPDomain, bool expectNeedSend)
     {
-        int contextDPRank = contextRank % contextTP;
-        int generationDPRank = generationRank % genTP;
+        int contextDPRank = (contextRank % (contextTP * contextCP)) / contextCP;
+        int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
@@ -2042,12 +2705,12 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTragetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+        auto const contextTargetInfo
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
-        EXPECT_EQ(expectRanks, contextTragetInfo.mIRanks);
-        EXPECT_EQ(expectPPDomain, contextTragetInfo.mDomainPPSize);
-        EXPECT_EQ(expectTPDomain, contextTragetInfo.mDomainTPSize);
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
         EXPECT_EQ(expectNeedSend, MLACacheFormatter::needSendCache(contextCache, genCache, contextRank));
     };
 
@@ -2133,11 +2796,11 @@ TEST(targetTest, CacheStateContextDP)
     contextTP = 1;
     genTP = 2;
 
-    auto const verfiyGeneration = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
+    auto const verifyGeneration = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
                                       int expectPPDomain, int expectTPDomain)
     {
-        int contextDPRank = contextRank % contextTP;
-        int generationDPRank = generationRank % genTP;
+        int contextDPRank = (contextRank % (contextTP * contextCP)) / contextCP;
+        int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
@@ -2149,17 +2812,17 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTragetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
+        auto const contextTargetInfo
+            = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, generationRank);
 
-        EXPECT_EQ(expectRanks, contextTragetInfo.mIRanks);
-        EXPECT_EQ(expectPPDomain, contextTragetInfo.mDomainPPSize);
-        EXPECT_EQ(expectTPDomain, contextTragetInfo.mDomainTPSize);
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
     };
 
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 
     contextTP = 1;
@@ -2169,9 +2832,9 @@ TEST(targetTest, CacheStateContextDP)
     contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
     genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
 
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 
     genEnableDP = false;
@@ -2184,8 +2847,8 @@ TEST(targetTest, CacheStateContextDP)
     contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
     genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
 
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 }

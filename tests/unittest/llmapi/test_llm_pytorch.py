@@ -1,3 +1,6 @@
+import asyncio
+import json
+import pathlib
 import random
 import time
 from contextlib import contextmanager, nullcontext
@@ -7,10 +10,11 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.executor import GenerationExecutorWorker
+from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
+                                          SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -19,17 +23,19 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
-    create_mock_nemo_lora_checkpoint)
+    create_mock_nemo_lora_checkpoint, compare_cuda_graph_lora_params_filler,
+    CUDAGraphLoRATestParams, test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
-                       global_kvcache_config, llama_model_path,
-                       llm_get_stats_async_test_harness,
+                       global_kvcache_config, global_kvcache_config_no_reuse,
+                       llama_model_path, llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness, llm_test_harness,
                        prompts, run_llm_abort_request,
+                       sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, similarity_score,
+                        skip_fp8_pre_ada, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -38,15 +44,31 @@ from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
 import torch
+from transformers.configuration_utils import PretrainedConfig
+
+from tensorrt_llm._torch.model_config import ModelConfig as _ModelConfig
+from tensorrt_llm._torch.models.checkpoints import \
+    HfCheckpointLoader as _HfCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
+    BaseConfigLoader as _BaseConfigLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    BaseWeightLoader as _BaseWeightLoader
+from tensorrt_llm._torch.models.modeling_utils import (
+    register_auto_model as _register_auto_model,
+    register_checkpoint_weight_loader as _register_checkpoint_weight_loader,
+    register_config_loader as _register_config_loader)
+
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from dataclasses import replace
 
 # isort: on
 
 
 @force_ampere
 @pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+@pytest.mark.part2
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
         backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
@@ -61,6 +83,7 @@ def test_tinyllama_logits_processor(enable_chunked_prefill):
         (False, True, False, True),
         (False, True, True, True),
     ])
+@pytest.mark.part0
 def test_llm_get_stats(return_context_logits, use_overlap,
                        enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
@@ -81,6 +104,7 @@ def test_llm_get_stats(return_context_logits, use_overlap,
         (False, True, False, True),
         (False, True, True, True),
     ])
+@pytest.mark.part1
 def test_llm_get_stats_async(return_context_logits, use_overlap,
                              enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_async_test_harness(
@@ -93,19 +117,26 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         enable_iter_req_stats=enable_iter_req_stats)
 
 
+@pytest.mark.part1
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)
 
 
 @force_ampere
 @pytest.mark.mpi_ray_parity
-@pytest.mark.parametrize(
-    "sampling_params",
-    [
-        SamplingParams()  # pytorch only supports n=1
-    ])
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
+@pytest.mark.part0
 def test_llm_abort_request(sampling_params):
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    llm_kwargs = {}
+    if sampling_params.use_beam_search:
+        if sampling_params.best_of is None:
+            llm_kwargs["max_beam_width"] = sampling_params.n
+        else:
+            llm_kwargs["max_beam_width"] = sampling_params.best_of
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              **llm_kwargs)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
@@ -117,6 +148,7 @@ def _validate_invalid_token_error_scope():
 
 
 @force_ampere
+@pytest.mark.part1
 def test_llm_invalid_input_token():
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     prompts = [
@@ -135,6 +167,7 @@ def test_llm_invalid_input_token():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_llm_invalid_input_token_async():
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     # NB: exc_info in _validate_invalid_token_error_scope creates a reference
@@ -166,6 +199,7 @@ def test_llm_invalid_input_token_async():
                         futures[collect_idx].result()
 
 
+@pytest.mark.part2
 def test_llm_reward_model():
     rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
@@ -187,6 +221,7 @@ def test_llm_reward_model():
 
 
 @skip_ray
+@pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config) as llm:
@@ -215,6 +250,7 @@ def test_llm_perf_metrics():
 
 
 @skip_ray
+@pytest.mark.part3
 def test_llm_prometheus():
     test_prompts = [
         "Hello, my name is",
@@ -238,6 +274,7 @@ def test_llm_prometheus():
 
 @skip_ray
 @pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.part3
 def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
                                                          "pytorch",
@@ -271,19 +308,74 @@ def test_embedding_bias_with_torch_sampler_strategies():
     )
 
 
+def test_lora_cuda_graph_params_filling_kernel_special_cases():
+    torch.cuda.set_device(0)
+
+    # test all requests have the same LoRA id case
+    test_params = CUDAGraphLoRATestParams(
+        batch_slot_ids=[0] * 10,
+        input_hidden_size=4096,
+        slot_ranks=[64] * 10,
+        max_lora_rank=64,
+        output_hidden_sizes=[123],
+        layer_module_mask=None,
+        dtype=torch.bfloat16,
+        seed=42,
+    )
+    compare_cuda_graph_lora_params_filler(test_params)
+
+    # test no LoRA in a batch case
+    test_params2 = replace(test_params,
+                           batch_slot_ids=[len(test_params.slot_ranks)] * 10)
+    compare_cuda_graph_lora_params_filler(test_params2)
+
+    # test all having three modules case
+    test_params3 = replace(test_params, output_hidden_sizes=[123, 456, 789])
+    compare_cuda_graph_lora_params_filler(test_params3)
+
+    # test some layer module have invalid weight pointers case
+    mask = torch.full((test_params3.module_count, test_params3.slot_count),
+                      True,
+                      dtype=torch.bool)
+    mask[0, 0] = False
+    mask[1, 7] = False
+    mask[2, 3] = False
+    test_params4 = replace(test_params3, layer_module_mask=mask)
+    compare_cuda_graph_lora_params_filler(test_params4)
+
+    # test mixed slot ids case
+    test_params5 = CUDAGraphLoRATestParams(
+        batch_slot_ids=[6, 2, 0, 1, 1, 1, 5, 6],
+        input_hidden_size=512,
+        slot_ranks=[8, 12, 4] * 2,
+        max_lora_rank=15,
+        output_hidden_sizes=[123, 456, 789],
+        layer_module_mask=None,
+        dtype=torch.bfloat16,
+        seed=42,
+    )
+    compare_cuda_graph_lora_params_filler(test_params5)
+
+    # test mixed slot with invalid weight pointers
+    mask = torch.full((test_params5.module_count, test_params5.slot_count),
+                      True,
+                      dtype=torch.bool)
+    mask[1, 3] = False
+    mask[2, 5] = False
+    mask[-1, -4] = False
+    test_params6 = replace(test_params5, layer_module_mask=mask)
+    compare_cuda_graph_lora_params_filler(test_params6)
+
+
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
         max_lora_rank=8,
         max_loras=2,
         max_cpu_loras=2)
-    llm = LLM(
-        model=f"{llm_models_root()}/llama-models/llama-7b-hf",
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None,
-        **llm_kwargs)
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              **llm_kwargs)
     try:
         prompts = [
             "美国的首都在哪里? \n答案:",
@@ -305,22 +397,33 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora():
-    llama_7b_lora_from_dir_test_harness()
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_llama_7b_lora(cuda_graph_config, use_speculative):
+    llm_kwargs = {
+        "cuda_graph_config":
+        cuda_graph_config,
+        "speculative_config":
+        NGramDecodingConfig(max_draft_len=5) if use_speculative else None
+    }
+    llama_7b_lora_from_dir_test_harness(**llm_kwargs)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora_default_modules() -> None:
+@test_lora_with_and_without_cuda_graph
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_llama_7b_lora_default_modules(cuda_graph_config,
+                                       use_speculative) -> None:
     lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
-    llm = LLM(
-        model=hf_model_dir,
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+    llm = LLM(model=hf_model_dir,
+              lora_config=lora_config,
+              speculative_config=NGramDecodingConfig(
+                  max_draft_len=5) if use_speculative else None,
+              cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -346,7 +449,8 @@ def test_llama_7b_lora_default_modules() -> None:
 
 def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int,
+        **llm_kwargs):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -360,14 +464,14 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
         repeats_per_call,
         LLM,
         lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        **llm_kwargs)
 
 
 @skip_gpu_memory_less_than_40gb
 @skip_ray  # https://nvbugs/5682551
-def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+@pytest.mark.part3
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
     """  # noqa: D205
@@ -376,11 +480,15 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
         max_loras=1,
         max_cpu_loras=2,
         repeat_calls=2,
-        repeats_per_call=3)
+        repeats_per_call=3,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
+        cuda_graph_config):
     """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
     cache size < LoRA CPU cache size.
     """  # noqa: D205
@@ -389,23 +497,29 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
         max_loras=1,
         max_cpu_loras=3,
         repeat_calls=1,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_read_from_cache_after_insert():
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
     """Test that loading and then using the same adapters loaded in cache works."""
     _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[3],
         max_loras=3,
         max_cpu_loras=3,
         repeat_calls=2,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
+@pytest.mark.part3
+@test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
-):
+        cuda_graph_config):
     """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
     cache over multiple llm.generate call repeated twice (two calls with the same requests):
     At the end of the 1st llm.generate call:
@@ -422,11 +536,14 @@ def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_ca
         max_loras=2,
         max_cpu_loras=2,
         repeat_calls=2,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+@pytest.mark.part2
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
 
     NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
@@ -446,9 +563,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(
                 host_cache_size=1),  # size in bytes
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+            cuda_graph_config=cuda_graph_config)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
@@ -456,14 +571,14 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             LLM,
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+            cuda_graph_config=cuda_graph_config)
 
 
 @skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora_config_overrides_peft_cache_config():
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
     """Tests that cache size args in lora_config LLM arg override the cache size
     parameters in peft_cache_config LLM arg.
     """    # noqa: D205
@@ -477,16 +592,13 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
         peft_cache_config=PeftCacheConfig(
             host_cache_size=1,  # size in bytes
             device_cache_percent=0.0000001),
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        cuda_graph_config=cuda_graph_config)
 
 
-# TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
-# https://jirasw.nvidia.com/browse/TRTLLM-5045
-@pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
-def test_nemotron_nas_lora() -> None:
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_nemotron_nas_lora(cuda_graph_config) -> None:
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
     ],
@@ -498,14 +610,15 @@ def test_nemotron_nas_lora() -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-    )
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     prompts = [
         "Hello, how are you?",
         "Hello, how are you?",
     ]
 
-    sampling_params = SamplingParams(max_tokens=10, add_special_tokens=False)
+    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
     lora_req = LoRARequest(
         "task-0", 0,
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
@@ -518,7 +631,9 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
     skip_fp8_pre_ada(use_fp8=True)
     model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
     lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
@@ -531,12 +646,9 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
                              max_cpu_loras=2)
     lora_req = LoRARequest("lora-chinese", 0, lora_dir)
 
-    llm = LLM(
-        model_dir,
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+    llm = LLM(model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
 
     try:
         output = llm.generate(prompt,
@@ -547,8 +659,46 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
     assert similar(output.outputs[0].text, reference)
 
 
+@skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_80gb
-def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
+def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
+    skip_fp8_pre_ada(use_fp8=True)
+
+    model_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+    lora_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8-lora-adapter_NIM_r8"
+
+    prompt = "What is the capital of the United States?"
+    expected_output = " Washington, D.C.\nWhat is the capital of the United States? Washington, D.C."
+
+    lora_config = LoraConfig(lora_dir=[lora_dir],
+                             max_lora_rank=8,
+                             max_loras=2,
+                             max_cpu_loras=2)
+    lora_req = LoRARequest("squad-lora", 0, lora_dir)
+
+    llm = LLM(model_dir,
+              tensor_parallel_size=2,
+              lora_config=lora_config,
+              cuda_graph_config=None)
+
+    try:
+        output = llm.generate(prompt,
+                              SamplingParams(max_tokens=50, temperature=0.0),
+                              lora_request=[lora_req])
+        generated_text = output.outputs[0].text
+        print(f"Generated output: {repr(generated_text)}")
+
+        similarity = similarity_score(generated_text, expected_output)
+        assert similar(generated_text, expected_output, threshold=0.8), \
+            f"Output similarity too low (similarity={similarity:.2%})!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
+    finally:
+        llm.shutdown()
+
+
+@skip_gpu_memory_less_than_80gb
+@pytest.mark.part2
+@test_lora_with_and_without_cuda_graph
+def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']
@@ -578,12 +728,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                         max_lora_rank=8,
                                         max_loras=2,
                                         max_cpu_loras=2)
-        llm = LLM(
-            model_dir,
-            lora_config=trtllm_lora_config,
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
@@ -601,7 +748,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
         assert len(outputs) == 2
 
 
-def test_gemma3_1b_instruct_multi_lora() -> None:
+@pytest.mark.part2
+@test_lora_with_and_without_cuda_graph
+def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']
@@ -639,7 +788,8 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         )
         llm = LLM(model_dir,
                   lora_config=trtllm_lora_config,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Is it ok to fill diesel in a petrol car?",
@@ -657,6 +807,84 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         assert len(outputs) == 2
 
 
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part3
+def test_lora_many_adapters_no_memory_leak() -> None:
+    """Verify GPU memory stays bounded when loading many unique LoRA adapters.
+
+    Creates 20 dummy adapters but sets max_loras=2 and max_cpu_loras=4 to
+    force eviction.  Without proper cleanup, _lora_weights can accumulate
+    GPU tensors for every loaded adapter, causing unbounded memory growth.
+    """
+    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
+    num_adapters = 20
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(num_adapters):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        del model
+        torch.cuda.empty_cache()
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths[:1],
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=4)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False)
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  kv_cache_config=kv_cache_config)
+
+        sampling_params = SamplingParams(max_tokens=20)
+        warmup_count = 5
+
+        mem_samples = []
+        for i in range(num_adapters):
+            lora_req = LoRARequest(f"lora-{i}", i, lora_paths[i])
+            output = llm.generate("Hello, tell me a story.",
+                                  sampling_params,
+                                  lora_request=lora_req)
+            assert output.outputs[0].text != ""
+
+            if i >= warmup_count:
+                mem_samples.append(torch.cuda.memory_allocated())
+
+        num_measured = len(mem_samples)
+        assert num_measured >= 2, "Not enough samples to measure growth"
+
+        total_growth = mem_samples[-1] - mem_samples[0]
+        per_adapter_mb = (total_growth / (num_measured - 1)) / (1024 * 1024)
+
+        # Each adapter is ~3 MB on GPU (r=8, 3 modules, 26 layers, bf16).
+        # The C++ PeftCacheManager handles eviction and _lora_weights
+        # stays empty, so per-adapter growth should be ~0.  If GPU tensors
+        # leak, we would see ~3 MB/adapter of linear growth.  Threshold
+        # of 1 MB/adapter catches leaks while tolerating noise from
+        # allocator fragmentation averaged over many samples.
+        max_per_adapter_mb = 1.0
+        assert per_adapter_mb < max_per_adapter_mb, (
+            f"GPU memory growing at {per_adapter_mb:.2f} MB/adapter over "
+            f"{num_measured} adapters (total {total_growth / (1024**2):.1f} MB). "
+            f"Possible _lora_weights leak.")
+
+
 @pytest.mark.parametrize(
     "lora_rank,max_lora_rank,description",
     [
@@ -665,6 +893,7 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         (16, 16, "rank_16"),
         (4, 8, "rank_4_max_8"),
     ])
+@pytest.mark.part3
 def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
                                        description):
     """Test load_torch_nemo_lora function with different LoRA rank configurations."""
@@ -694,6 +923,7 @@ def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
     }, f"Expected correct module mapping for {description}"
 
 
+@pytest.mark.part0
 def test_nemo_lora_unsupported_modules_validation(tmp_path):
     """Test validation of unsupported modules in NeMo LoRA."""
     from tensorrt_llm.lora_manager import load_torch_nemo_lora
@@ -719,7 +949,9 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 
 
 @force_ampere
-def test_gqa_nemo_lora(tmp_path):
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
     """
     Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
 
@@ -764,6 +996,7 @@ def test_gqa_nemo_lora(tmp_path):
         model=model_path,
         lora_config=lora_config,
         kv_cache_config=global_kvcache_config,
+        cuda_graph_config=cuda_graph_config,
     )
 
     try:
@@ -795,18 +1028,88 @@ def test_gqa_nemo_lora(tmp_path):
         llm.shutdown()
 
 
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part0
+def test_qwen_moe_shared_expert_lora():
+    """Test MoE shared expert LoRA on Qwen1.5-MoE with PyTorch backend.
+
+    Verifies that LoRA adapters targeting the shared expert in MoE models
+    are correctly applied and produce different outputs from the base model.
+    Uses the same model/adapter/prompt as the TRT integration test
+    (test_llm_qwen1_5_moe_single_gpu_lora in test_qwen.py).
+    """
+    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
+    lora_dir = f"{llm_models_root()}/Upcycled-Qwen1.5-MoE2.7B-LoRA"
+
+    lora_config = LoraConfig(
+        lora_dir=[lora_dir],
+        lora_target_modules=[
+            'attn_q',
+            'attn_k',
+            'attn_v',
+            'attn_dense',
+            'mlp_h_to_4h',
+            'mlp_gate',
+            'mlp_4h_to_h',
+        ],
+        max_lora_rank=64,
+        max_loras=2,
+        max_cpu_loras=2,
+    )
+
+    llm = LLM(model=model_dir,
+              lora_config=lora_config,
+              gather_generation_logits=True)
+    sampling_params = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0)
+
+    try:
+        lora_request = LoRARequest("moe-lora", 0, lora_dir)
+        outputs_with = llm.generate(["What is your name?"],
+                                    sampling_params,
+                                    lora_request=lora_request)
+        tokens_with = list(outputs_with[0].outputs[0].token_ids)
+        logprobs_with = outputs_with[0].outputs[0].logprobs
+
+        outputs_without = llm.generate(["What is your name?"],
+                                       sampling_params,
+                                       lora_request=None)
+        tokens_without = list(outputs_without[0].outputs[0].token_ids)
+        logprobs_without = outputs_without[0].outputs[0].logprobs
+
+        tokens_differ = tokens_with != tokens_without
+        logprobs_differ = False
+        if logprobs_with and logprobs_without:
+            for lp_w, lp_wo in zip(logprobs_with, logprobs_without,
+                                   strict=True):
+                lp_val_w = next(iter(lp_w.values())).logprob
+                lp_val_wo = next(iter(lp_wo.values())).logprob
+                if abs(lp_val_w - lp_val_wo) > 1e-6:
+                    logprobs_differ = True
+                    break
+
+        assert tokens_differ or logprobs_differ, (
+            "LoRA outputs identical to base model (same tokens AND same "
+            "logprobs) -- shared expert LoRA not applied")
+    finally:
+        llm.shutdown()
+
+
 class TestLlmError:
 
+    @pytest.mark.part3
     def test_max_num_token_check(self):
         """ LLM should raise error when got prompt length exceed the valid range. """
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
 
-        with pytest.raises(ValueError,
-                           match="should not exceed max_num_tokens"):
-            ids = [random.randint(10, 100) for _ in range(101)]
-            llm.generate([ids])
+        try:
+            with pytest.raises(RequestError,
+                               match="should not exceed max_num_tokens"):
+                ids = [random.randint(10, 100) for _ in range(101)]
+                llm.generate([ids])
+        finally:
+            llm.shutdown()
 
 
 class FailingExecutorWorker(GenerationExecutorWorker):
@@ -827,6 +1130,7 @@ FailingExecutor = type(
 
 
 @skip_ray
+@pytest.mark.part2
 def test_llm_with_proxy_error():
     """Test that LLM properly handles GenerationExecutorWorker constructor failures.
 
@@ -880,6 +1184,169 @@ def test_min_tokens(use_speculative: bool):
     assert len(res.outputs[0].token_ids) == output_len
 
 
+@pytest.mark.part0
+def test_min_tokens_long_prompt():
+    """Check min_tokens is respected when prompt is longer than min_tokens.
+
+    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    total token count (prompt + generated) against the raw min_tokens value
+    instead of comparing generated token count only.  When prompt_len >=
+    min_tokens the EOS suppression was never activated, allowing early
+    termination.
+    """
+    min_tok = 50
+    max_tok = 100
+    # Prompt long enough so that prompt_len > min_tok.  "Hello " tokenises
+    # to ~1-2 tokens with most tokenizers, so 200 repetitions ≈ 200-400
+    # tokens >> min_tok.
+    long_prompt = "Hello " * 200
+
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=2,
+        kv_cache_config=global_kvcache_config,
+        max_num_tokens=2048,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=min_tok,
+        temperature=1,
+    )
+    res = llm.generate(long_prompt, sampling_params=sampling_params)
+
+    assert len(res.outputs) == 1
+    generated_len = len(res.outputs[0].token_ids)
+    assert generated_len >= min_tok, (
+        f"Generated only {generated_len} tokens with min_tokens={min_tok} "
+        f"and a long prompt.  Bug 5823135 regression.")
+
+
+_LAST_VOCAB_TOKEN_ID = 255
+_LAST_VOCAB_EOS_TOKEN_ID = 2
+
+
+class _LastVocabConfig(PretrainedConfig):
+
+    def __init__(self):
+        self.architectures = ["_LastVocabModel"]
+        self.torch_dtype = torch.float16
+        self.num_key_value_heads = 4
+        self.num_attention_heads = 4
+        self.hidden_size = 64
+        self.vocab_size = 256
+        self.num_hidden_layers = 1
+        self.eos_token_id = _LAST_VOCAB_EOS_TOKEN_ID
+
+    @property
+    def head_dim(self):
+        return self.hidden_size // self.num_attention_heads
+
+
+@_register_auto_model("_LastVocabModel")
+class _LastVocabModel(torch.nn.Module):
+    """Dummy model whose logits always favour the last vocab token (id 255).
+
+    The original bug made logits[..., -1] suppress this token via Python
+    negative indexing when ignore_eos + min_tokens were both set.
+    """
+
+    def __init__(self, model_config: _ModelConfig):
+        super().__init__()
+        self.model_config = model_config
+
+    def infer_max_seq_len(self):
+        return 2048
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
+
+    def forward(self, *, input_ids, attn_metadata, **kwargs):
+        num_batch_tokens = input_ids.size(0)
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+
+        logits = torch.zeros((num_batch_tokens, self.config.vocab_size),
+                             device="cuda",
+                             dtype=self.config.torch_dtype)
+        logits[:, _LAST_VOCAB_TOKEN_ID] = 100.0
+
+        if not kwargs.get("return_context_logits", False):
+            logits = logits[last_tokens]
+        return {"logits": logits}
+
+    def load_weights(self, weights, weight_mapper=None, skip_modules=None):
+        pass
+
+
+@_register_checkpoint_weight_loader("_LAST_VOCAB_FMT")
+class _LastVocabWeightLoader(_BaseWeightLoader):
+
+    def load_weights(self, checkpoint_dir, **kwargs):
+        return {}
+
+
+@_register_config_loader("_LAST_VOCAB_FMT")
+class _LastVocabConfigLoader(_BaseConfigLoader):
+
+    def load(self, checkpoint_dir, **kwargs):
+        return _ModelConfig(pretrained_config=_LastVocabConfig())
+
+
+@pytest.mark.part0
+def test_min_tokens_with_ignore_eos():
+    """Check ignore_eos + min_tokens does not suppress the last vocab token.
+
+    The original bug: ignore_eos sets end_id to -1. The min_length penalty
+    used that value, so logits[..., -1] suppressed the last vocab token
+    (id 255) instead of the actual EOS token.
+
+    Uses a dummy model that always outputs the last vocab token (id 255).
+    Verifies that token still appears in the output when ignore_eos + min_tokens
+    are both set.
+    """
+    max_tok = 20
+
+    llm = LLM(
+        model=pathlib.Path("dummy_last_vocab_path"),
+        backend="pytorch",
+        max_batch_size=2,
+        max_seq_len=128,
+        max_num_tokens=32,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        disable_overlap_scheduler=True,
+        checkpoint_loader=_HfCheckpointLoader(
+            weight_loader=_LastVocabWeightLoader(),
+            config_loader=_LastVocabConfigLoader()),
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=10,
+        ignore_eos=True,
+        temperature=0.0,
+        end_id=_LAST_VOCAB_EOS_TOKEN_ID,
+    )
+
+    with llm:
+        res = llm.generate([[1, 2, 3]], sampling_params=sampling_params)
+
+    assert len(res) == 1
+    token_ids = res[0].outputs[0].token_ids
+
+    # With ignore_eos, generation must run for exactly max_tokens.
+    assert len(token_ids) == max_tok, (
+        f"Generated {len(token_ids)} tokens, expected {max_tok}.")
+
+    # The dummy model always outputs the last vocab token (id 255).
+    # The original bug suppressed logits[..., -1] which is this token.
+    # After the fix, the last vocab token must NOT be suppressed.
+    assert all(t == _LAST_VOCAB_TOKEN_ID for t in token_ids), (
+        f"Expected all tokens to be {_LAST_VOCAB_TOKEN_ID}, got {token_ids}. "
+        f"logits[..., -1] may be incorrectly suppressing the last vocab token.")
+
+
 @skip_ray
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
@@ -927,16 +1394,20 @@ def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
 
 class TestLlmError:
 
+    @pytest.mark.part3
     def test_max_num_token_check(self):
         """ LLM should raise error when got prompt length exceed the valid range. """
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
 
-        with pytest.raises(ValueError,
-                           match="should not exceed max_num_tokens"):
-            ids = [random.randint(10, 100) for _ in range(101)]
-            llm.generate([ids])
+        try:
+            with pytest.raises(RequestError,
+                               match="should not exceed max_num_tokens"):
+                ids = [random.randint(10, 100) for _ in range(101)]
+                llm.generate([ids])
+        finally:
+            llm.shutdown()
 
 
 @skip_ray
@@ -976,10 +1447,67 @@ async def test_llm_rpc_streaming():
         print(f"get result: {outputs}")
 
 
+@skip_ray
+def test_llm_rpc_get_stats():
+    """Test that get_stats works with RPC orchestrator."""
+
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             orchestrator_type="rpc") as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+
+        # Generate some output to produce stats
+        for output in llm.generate(
+                prompts, sampling_params=SamplingParams(max_tokens=5)):
+            print(output)
+
+        stats = llm.get_stats(timeout=5)
+
+        assert len(stats) > 0, "Should have at least one stats entry"
+        # Stats should be JSON strings that can be parsed
+        parsed = json.loads(stats[0]) if isinstance(stats[0], str) else stats[0]
+        assert "iter" in parsed, "Stats should contain 'iter' field"
+        assert "cpuMemUsage" in parsed, "Stats should contain 'cpuMemUsage' field"
+
+
+@skip_ray
+@pytest.mark.asyncio
+async def test_llm_rpc_get_stats_async():
+    """Test that get_stats_async works with RPC orchestrator."""
+    import json
+
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             orchestrator_type="rpc") as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+
+        # Generate some output to produce stats
+        async for output in llm.generate_async(
+            prompts[0], sampling_params=SamplingParams(max_tokens=5)):
+            print(output)
+
+        # Get stats via async API
+        stats_result = llm.get_stats_async(timeout=2)
+
+        # Should be able to iterate over results
+        stats_count = 0
+        async for stat in stats_result:
+            parsed = json.loads(stat) if isinstance(stat, str) else stat
+            assert "iter" in parsed, "Stats should contain 'iter' field"
+            stats_count += 1
+            if stats_count >= 1:
+                break  # Just verify we can get at least one
+
+        assert stats_count > 0, "Should have received at least one stat"
+
+
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-def test_llm_context_only_timed_out():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+def test_llm_context_only_timed_out(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -991,11 +1519,15 @@ def test_llm_context_only_timed_out():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
-                  backend="UCX", kv_transfer_timeout_ms=1000),
+                  backend=backend,
+                  kv_transfer_timeout_ms=1000,
+                  transceiver_runtime=transceiver_runtime),
               **llm_args_extra)
 
     max_tokens = 1
@@ -1052,8 +1584,15 @@ def test_llm_context_only_timed_out():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-def test_llm_context_only_timed_out_kv_cache_exhausted(
-        sender_future_timeout_ms):
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
+                                                       backend,
+                                                       transceiver_runtime):
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    if transceiver_runtime == "PYTHON" and backend == "UCX":
+        pytest.skip("Python transceiver (V2) does not support UCX backend")
+
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1068,15 +1607,15 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
                                     max_tokens=1000,
                                     enable_block_reuse=False)
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=kv_cache_config,
-        tensor_parallel_size=tp_size,
-        cache_transceiver_config=CacheTransceiverConfig(
-            backend="UCX",
-            kv_transfer_timeout_ms=1000,
-            kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
-        **llm_args_extra)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=kv_cache_config,
+              tensor_parallel_size=tp_size,
+              cache_transceiver_config=CacheTransceiverConfig(
+                  backend=backend,
+                  kv_transfer_timeout_ms=1000,
+                  kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms,
+                  transceiver_runtime=transceiver_runtime),
+              **llm_args_extra)
 
     max_tokens = 1
     sampling_params = SamplingParams(max_tokens=max_tokens)
@@ -1122,3 +1661,312 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(
     final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
 
     assert final_used_num_blocks == 0
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+async def test_llm_disagg_gen_cancelled(transceiver_runtime):
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    llm_ctx = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=tp_size,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
+                  **llm_args_extra)
+
+    llm_gen = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=tp_size,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
+                  **llm_args_extra)
+
+    try:
+        num_iterations = 10
+        prev_after_free_num_blocks = 0
+        for iter in range(num_iterations):
+
+            max_tokens = 1
+            sampling_params = SamplingParams(max_tokens=max_tokens)
+            disaggregated_params = DisaggregatedParams(
+                request_type="context_only")
+
+            prompt = [
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
+                * 10
+            ]
+            # Send context-only request
+            ctx_outputs = []
+            for output in llm_ctx.generate(
+                    prompt,
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params):
+                ctx_outputs.append(output)
+
+            assert len(ctx_outputs) == 1
+
+            max_tokens = 10000
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True)
+            disaggregated_params = ctx_outputs[0].disaggregated_params
+            disaggregated_params.request_type = "generation_only"
+
+            # Send gen-only request
+            gen_output = llm_gen.generate_async(
+                prompt[0],
+                sampling_params=sampling_params,
+                disaggregated_params=disaggregated_params)
+
+            # Sleep a little to have tokens generated, between 0.2 and 0.7 seconds
+            sleep_time = random.uniform(0.2, 0.7)
+            time.sleep(sleep_time)
+            #Abort the generation request
+            gen_output.abort()
+            result = await gen_output.aresult()
+            num_output_tokens = len(result.outputs[0].token_ids)
+            print(f"num output tokens: {num_output_tokens}")
+            assert result.outputs[0].finish_reason == "cancelled"
+
+            # Wait until KV cache blocks are released (usedNumBlocks == 0)
+            time.sleep(1.)
+            max_retries = 10
+            all_results = []
+            for _ in range(max_retries):
+                results = llm_gen.get_stats(2)
+                print("len(results):", len(results))
+                all_results.extend(results)
+                if all_results and all_results[-1]["kvCacheStats"][
+                        "usedNumBlocks"] == 0:
+                    break
+                time.sleep(1)
+            else:
+                pytest.fail(
+                    f"KV cache blocks not released after {max_retries} retries")
+            results = all_results
+
+            after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
+            assert after_used_num_blocks == 0
+
+            after_free_num_blocks = results[-1]["kvCacheStats"]["freeNumBlocks"]
+            # Check that number of free blocks stays the same
+            if iter > 0:
+                assert after_free_num_blocks == prev_after_free_num_blocks
+
+            # Check that number of free blocks stays the same
+            prev_after_free_num_blocks = after_free_num_blocks
+    finally:
+        llm_ctx.shutdown()
+        llm_gen.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.timeout(60)
+def test_priority_request_completes_before_low_priority():
+    """High-priority request must be scheduled before a lower-priority one.
+
+    Setup (max_batch_size=1, WaitingQueuePolicy.PRIORITY):
+      - Request 1: no explicit priority (default 0.5), max_tokens=500  – long, ignore_eos
+      - Request 2: no explicit priority (default 0.5), max_tokens=5   – short
+      - Request 3: priority=0.9,                       max_tokens=5   – short + high priority
+
+    All three requests are submitted before the executor has a chance to
+    schedule any of them.  With a PRIORITY waiting queue the executor will
+    pick Request 3 ahead of Request 2.  Therefore Request 3 must complete
+    before Request 2 regardless of how long Request 1 takes.
+    """
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY),
+    )
+
+    prompt = "A B C D E F G H I J"
+    completion_order = []
+
+    async def run():
+        # Submit all three requests before the event loop can schedule any of
+        # them – they all land in the waiting queue simultaneously.
+        # Request 1 uses ignore_eos so it keeps the batch slot busy for the
+        # full max_tokens count rather than stopping at an early EOS token.
+        out1 = llm.generate_async(
+            prompt,
+            SamplingParams(max_tokens=500, temperature=0, ignore_eos=True))
+        out2 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0))
+        out3 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0),
+                                  priority=0.9)
+
+        async def await_and_record(output, req_id: int):
+            await output.aresult()
+            completion_order.append(req_id)
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                await_and_record(out1, 1),
+                await_and_record(out2, 2),
+                await_and_record(out3, 3),
+            ),
+            timeout=55,
+        )
+
+    asyncio.run(run())
+    del llm
+
+    assert 2 in completion_order and 3 in completion_order, (
+        f"Not all requests completed. Completion order: {completion_order}")
+    idx_req2 = completion_order.index(2)
+    idx_req3 = completion_order.index(3)
+    assert idx_req3 < idx_req2, (
+        f"Request 3 (priority=0.9) should complete before Request 2 (no priority). "
+        f"Completion order: {completion_order}")
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    llm_ctx = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=tp_size,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
+                  **llm_args_extra)
+
+    llm_gen = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=tp_size,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
+                  **llm_args_extra)
+
+    try:
+        num_iterations = 10
+        num_concurrent_requests = 20
+        prev_after_free_num_blocks = 0
+        for iter in range(num_iterations):
+
+            max_tokens = 1
+            sampling_params = SamplingParams(max_tokens=max_tokens)
+            disaggregated_params = DisaggregatedParams(
+                request_type="context_only")
+
+            prompts = [
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
+                * random.randint(5, 15) for _ in range(num_concurrent_requests)
+            ]
+            # Send context-only requests
+            ctx_outputs = []
+            for prompt in prompts:
+                for output in llm_ctx.generate(
+                    [prompt],
+                        sampling_params=sampling_params,
+                        disaggregated_params=disaggregated_params):
+                    ctx_outputs.append(output)
+
+            assert len(ctx_outputs) == num_concurrent_requests
+
+            max_tokens = 300
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True)
+
+            # Send multiple gen-only requests concurrently
+            async def process_request(idx):
+                disagg_params = ctx_outputs[idx].disaggregated_params
+                disagg_params.request_type = "generation_only"
+
+                tokens_out = 0
+                # Ensure we always cancel early to avoid race conditions
+                stop_after_tokens = random.randint(10, 50)
+                finished_reason = None
+                async for gen_output in llm_gen.generate_async(
+                        prompts[idx],
+                        sampling_params=sampling_params,
+                        disaggregated_params=disagg_params,
+                        streaming=True):
+                    tokens_out += 1
+                    finished_reason = gen_output.outputs[0].finish_reason
+                    if tokens_out == stop_after_tokens:
+                        gen_output.abort()
+
+                return finished_reason, stop_after_tokens
+
+            # Launch all requests concurrently
+            import asyncio
+            results = await asyncio.gather(
+                *[process_request(i) for i in range(num_concurrent_requests)])
+
+            # Verify all requests were cancelled
+            for finished_reason, stop_after_tokens in results:
+                assert finished_reason is not None
+                assert finished_reason == "cancelled"
+
+            # Check that the number of free/used blocks is as expected
+            time.sleep(1.)
+            max_retries = 10
+            for _ in range(max_retries):
+                stats_results = llm_gen.get_stats(2)
+                print("len(stats_results):", len(stats_results))
+                if len(stats_results) > 0:
+                    break
+                time.sleep(1)
+            else:
+                pytest.fail(f"Failed to get stats after {max_retries} retries")
+
+            after_used_num_blocks = stats_results[-1]["kvCacheStats"][
+                "usedNumBlocks"]
+            assert after_used_num_blocks == 0
+
+            after_free_num_blocks = stats_results[-1]["kvCacheStats"][
+                "freeNumBlocks"]
+            # Check that number of free blocks stays the same
+            if iter > 0:
+                assert after_free_num_blocks == prev_after_free_num_blocks
+
+            # Check that number of free blocks stays the same
+            prev_after_free_num_blocks = after_free_num_blocks
+    finally:
+        llm_ctx.shutdown()
+        llm_gen.shutdown()

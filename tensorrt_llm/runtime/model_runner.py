@@ -24,6 +24,7 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
+from .._deprecation import emit_engine_arch_deprecation
 from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
 from ..bindings import MpiComm
 from ..bindings.executor import Executor
@@ -473,6 +474,7 @@ class ModelRunnerMixin:
                 prompt_table,
                 torch.Tensor), "Prompt table should be str or torch.Tensor"
             prompt_table_data = prompt_table.to(dtype=self.dtype)
+            torch.cuda.current_stream().synchronize()
 
         return prompt_table_data
 
@@ -548,6 +550,7 @@ class ModelRunner(ModelRunnerMixin):
             lora_manager (LoraManager):
                 The LoRA manager to handle LoRA weights.
         """
+        emit_engine_arch_deprecation("ModelRunner")
         self.session = session
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len

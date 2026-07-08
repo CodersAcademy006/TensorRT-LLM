@@ -18,6 +18,7 @@
 // Separate from unfusedAttentionKernel to accelerate compiling.
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -30,8 +31,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -425,19 +426,26 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             int const token_idx_in_seq = past_seq_len + local_token_idx;
             bool const valid_token = token_idx_in_seq < cache_seq_len;
 
-            // NOTE: only spec decoding needs the position offsets.
-            // In the generation phase, we assume all sequences should have the same input length.
-            int const rotary_position
-                = (params.spec_decoding_position_offsets != nullptr ? (
-                       params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
-                       + past_seq_len)
-                                                                    : token_idx_in_seq)
-                + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
-
             if (!valid_token)
             {
                 continue;
             }
+
+            // NOTE: only spec decoding needs the position offsets.
+            // In the generation phase, we assume all sequences should have the same input length.
+            // Helix parallelism: use helix_position_offsets if available (absolute position).
+            int const rotary_position
+                = (params.helix_position_offsets != nullptr ? params.helix_position_offsets[global_token_idx]
+                          : params.spec_decoding_position_offsets != nullptr
+                          ? (params.spec_decoding_position_offsets[local_token_idx
+                                 + batch_idx * params.max_input_seq_len]
+                              + past_seq_len)
+                          : token_idx_in_seq)
+                + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
+
+            // Helix parallelism: determine if this rank is inactive for this request.
+            bool const helix_inactive
+                = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx];
 
             // Is the token and head dim maksed.
             bool const valid_head_dim_idx = head_dim_idx < params.size_per_head;
@@ -605,7 +613,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                         }
                     }
 
-                    if (valid_kv_cache_pos)
+                    if (valid_kv_cache_pos && !helix_inactive)
                     {
                         if constexpr (ENABLE_8BITS_CACHE)
                         {
@@ -778,7 +786,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     // Head idx.
     int const head_idx = blockIdx.y;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     // Variable sequence length.
@@ -843,10 +851,17 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         // NOTE: only spec decoding needs the position offsets.
         // In the generation phase, we assume all sequences should have the same input length.
-        int const rotary_position = params.spec_decoding_position_offsets != nullptr
+        // Helix parallelism: use helix_position_offsets if available (absolute position).
+        int const rotary_position = params.helix_position_offsets != nullptr
+            ? params.helix_position_offsets[bounded_global_token_idx]
+            : params.spec_decoding_position_offsets != nullptr
             ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
                 + cache_seq_len - actual_seq_len)
             : token_idx_in_kv_cache;
+
+        // Helix parallelism: determine if this rank is inactive for this request.
+        bool const helix_inactive
+            = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx];
 
         // head_num == kv_head_num:
         //   src QKV: [batch, time, 3, head_num, size_per_head]
@@ -885,12 +900,20 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
 
         // Cos/sin cache.
+        // For mrope, index by `bounded_global_token_idx` (batch-flat
+        // per-token entry) rather than `rotary_position` (request-internal
+        // KV-cache position). Mrope cos/sin is a per-token, per-axis quantity
+        // -- different requests at the same `rotary_position` have different
+        // (T, H, W) coordinates, so sharing a buffer slot across requests
+        // (which request-internal indexing forces once `batch_idx` is
+        // dropped) silently corrupts attention for multi-context-request
+        // batches. Batch-flat indexing also lets Python materialize cos/sin
+        // for only the current iteration's tokens (no chunk_end_pos padding).
         [[maybe_unused]] float2 const* rotary_coef_cache_buffer = nullptr;
         if (params.mrope_rotary_cos_sin != nullptr)
         {
-            rotary_coef_cache_buffer = params.mrope_rotary_cos_sin
-                + batch_idx * params.rotary_embedding_max_positions * params.half_rotary_dim
-                + static_cast<size_t>(rotary_position) * params.half_rotary_dim;
+            rotary_coef_cache_buffer
+                = params.mrope_rotary_cos_sin + static_cast<size_t>(bounded_global_token_idx) * params.half_rotary_dim;
         }
         else
         {
@@ -1008,15 +1031,19 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     }
                 }
 
-                if (valid_kv_cache_pos)
+                if (valid_kv_cache_pos && !helix_inactive)
                 {
                     if constexpr (ENABLE_8BITS_CACHE)
                     {
                         inBlockIdx = inBlockIdx * ELTS_PER_VEC;
-                        // Cast float scale to dst data type.
+                        // Cast float scale to dst data type. Default to 1.0
+                        // when the scale pointer is nullptr; the surrounding
+                        // peer reads in this file already follow this pattern
+                        // (e.g. lines 579, 989).
                         using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
                         TScale scaleOrigQuant;
-                        mmha::convert_from_float(&scaleOrigQuant, params.qkv_scale_orig_quant[0]);
+                        mmha::convert_from_float(&scaleOrigQuant,
+                            params.qkv_scale_orig_quant != nullptr ? params.qkv_scale_orig_quant[0] : 1.0f);
                         // Store 8bits kv cache.
                         mmha::store_8bits_vec(kDst, k, inBlockIdx, scaleOrigQuant);
                         mmha::store_8bits_vec(vDst, v, inBlockIdx, scaleOrigQuant);
@@ -1083,7 +1110,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1865,4 +1892,5 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

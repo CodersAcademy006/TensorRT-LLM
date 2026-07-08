@@ -15,20 +15,21 @@
  */
 
 #pragma once
-#include "cubin/kernelMetaInfo.h"
 #include "fmhaRunnerParams.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runPrepareCustomMask(
-    TllmGenFmhaKernelMetaInfo const& kernelMeta, TllmGenFmhaRunnerParams const& runnerParams, cudaStream_t stream);
+void runPrepareCustomMask(TllmGenFmhaRunnerParams const& runnerParams, FmhaKernelType kernelType, int32_t stepQ,
+    int32_t stepKv, int32_t tileSizeQ, int32_t tileSizeKv, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,12 @@ constexpr bool isMLA = IS_MLA;
 static_assert((isMLA || validElemsPerHead <= 256) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
 constexpr uint32_t headElems = validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
 static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576, "not implemented");
+// Number of head elements RoPE is applied to. Equals validElemsPerHead for full rotary; smaller for
+// partial rotary, in which case [validRopeElemsPerHead, validElemsPerHead) is passed through unrotated.
+constexpr uint32_t validRopeElemsPerHead = ROPE_ELEMS;
+static_assert(validRopeElemsPerHead > 0 && validRopeElemsPerHead <= validElemsPerHead && validRopeElemsPerHead % 2 == 0
+        && (sizeof(CacheElem) * validRopeElemsPerHead) % 16 == 0,
+    "ROPE_ELEMS must be a positive, even multiple yielding 16B-aligned rope region and not exceed the head size");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
 #if SPEC_DEC
@@ -90,6 +96,9 @@ struct BeamSearchParams
                                              // match trt-llm API.
 };
 
+uint32_t computeNbSubSeqPerSeqMHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
+
 void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -128,7 +137,16 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
+uint32_t computeNbSubSeqPerSeqHopperF8MHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
 
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
@@ -141,7 +159,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if USE_INPUT_KV
     InputHead const* qkv,
 #if ROPE_STYLE != 0
-    Vec<float, validElemsPerHead> const* ropeCosSin,
+    Vec<float, validRopeElemsPerHead> const* ropeCosSin,
 #endif
 #else
     InputHead const* q,
@@ -167,6 +185,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
                                             // int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 

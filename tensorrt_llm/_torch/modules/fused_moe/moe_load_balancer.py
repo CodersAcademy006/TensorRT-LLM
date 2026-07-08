@@ -449,6 +449,9 @@ class SingleLayerMoeLoadBalancer:
     def get_layer_idx(self):
         return self.single_layer_load_balancer_impl.get_layer_id()
 
+    def get_old_rank_expert_ids(self):
+        return self.single_layer_load_balancer_impl.get_old_rank_expert_ids()
+
     def get_load_expert_ids(self):
         assert self.updates_enabled, "should not call get_load_expert_ids when using statistic routing"
         return self.load_expert_ids
@@ -1073,9 +1076,11 @@ class MoeLoadBalancer:
 moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
     'DeepseekV32ForCausalLM',
+    'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
+    'NemotronHForCausalLM',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
 ]

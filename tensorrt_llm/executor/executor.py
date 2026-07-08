@@ -4,10 +4,11 @@ import multiprocessing
 import platform
 import signal
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
                     Optional, Union)
 
@@ -34,7 +35,8 @@ from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
 from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
-from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
+from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
+                      PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
@@ -88,13 +90,20 @@ class GenerationExecutor(ABC):
         self.kv_events_queues = IterationResultQueue()
         self.stats_queues = IterationResultQueue()
 
-        atexit.register(self.shutdown)
+        atexit.register(
+            lambda ref, finalizer=type(self).shutdown: finalizer(obj)
+            if (obj := ref()) is not None else None,
+            weakref.ref(self))
 
         # This is used to capture the exceptions from the threads.
         self._error_queue = Queue()
 
         # A flag to avoid calling shutdown() recursively. This happens when the background threads raise errors.
         self.doing_shutdown = False
+
+        # Tracks unrecoverable engine errors (e.g. CUDA OOM crash).
+        # Once set, health checks return unhealthy and shutdown is initiated.
+        self._fatal_error: Optional[BaseException] = None
 
         self._last_client_id: int = 1
 
@@ -125,8 +134,9 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
-        cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -152,8 +162,9 @@ class GenerationExecutor(ABC):
             trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
-            arrival_time=arrival_time)
+            cache_salt=cache_salt,
+            arrival_time=arrival_time,
+            priority=priority)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -169,6 +180,7 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -194,6 +206,7 @@ class GenerationExecutor(ABC):
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
+            cs = cache_salt[i] if isinstance(cache_salt, list) else cache_salt
             future = self.generate_async(
                 p,
                 sampling_params=sp,
@@ -201,7 +214,8 @@ class GenerationExecutor(ABC):
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 streaming=False,
-                disaggregated_params=disaggregated_params)
+                disaggregated_params=disaggregated_params,
+                cache_salt=cs)
             futures.append(future)
 
         for future in futures:
@@ -212,7 +226,7 @@ class GenerationExecutor(ABC):
 
         return futures
 
-    def _get_next_client_id(self):
+    def _get_next_client_id(self) -> int:
         # (self._last_client_id + 1) % UINT64_MAX
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
@@ -221,7 +235,7 @@ class GenerationExecutor(ABC):
             self, request: GenerationRequest) -> Optional[LogprobParams]:
         """Store logprobs-related fields from request for the later logprob calculation."""
         logprob_params = None
-        if request.sampling_params.logprobs or request.sampling_params.prompt_logprobs:
+        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs is not None:
             logprob_params = LogprobParams(
                 logprobs=request.sampling_params.logprobs,
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
@@ -231,7 +245,11 @@ class GenerationExecutor(ABC):
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
                     not request.sampling_params._need_return_generation_logits)
-                or self.postproc_config.num_postprocess_workers > 0)
+                or self.postproc_config.num_postprocess_workers > 0,
+                logprobs_simple_format=request.sampling_params.
+                logprobs_simple_format,
+                prompt_logprobs_simple_format=request.sampling_params.
+                prompt_logprobs_simple_format)
 
         return logprob_params
 
@@ -276,24 +294,93 @@ class GenerationExecutor(ABC):
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
+                self._set_fatal_error(error)
                 self.shutdown()
             raise error
 
-        # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
-        # more than one error.
-        if not self._error_queue.empty():
-            e = self._error_queue.get()
+        # Drain the first error from the queue using get_nowait() to
+        # avoid blocking if another thread consumed the item between
+        # the empty() check and the get() call.  Per-request errors
+        # (str / RequestError) are re-raised without marking the executor
+        # fatal; only system-level errors trigger shutdown.
+        try:
+            e = self._error_queue.get_nowait()
             self._error_queue.task_done()
-            self.shutdown()
-            # We can catch some exceptions here.
+            if isinstance(e, str):
+                e = RequestError(e)
+            elif not isinstance(e, BaseException):
+                e = RuntimeError(repr(e))
+            if not isinstance(e, RequestError):
+                self._set_fatal_error(e)
+                self.shutdown()
             raise e
+        except Empty:
+            pass
+
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Record an unrecoverable engine error.
+
+        Only the first error is kept; subsequent calls are no-ops.
+        A narrow TOCTOU race exists (two threads could both pass the
+        ``is None`` check), but the consequence is merely a different
+        error in the log — both are fatal and both trigger shutdown.
+
+        Args:
+            error: The exception to record as the fatal error.
+        """
+        if self._fatal_error is None:
+            self._fatal_error = error
+            logger.error(f"Fatal engine error recorded: {repr(error)}")
 
     def is_shutdown(self) -> bool:
-        return self.doing_shutdown
+        """Return True if the executor is shutting down or fatally errored."""
+        return self.doing_shutdown or self._fatal_error is not None
+
+    def check_health(self) -> bool:
+        """Check whether the executor is healthy and able to process requests.
+
+        Returns False if the executor has been shut down, has a fatal
+        error, or has pending errors in the error queue.  Safe to call
+        from any thread (the ``_error_queue`` is a thread-safe
+        ``queue.Queue``).
+
+        This method drains the error queue directly rather than calling
+        ``_handle_background_error()`` (which is documented for
+        main-thread use, calls ``shutdown()`` + ``raise``, and can
+        cause re-entrancy issues when invoked from health-check or
+        event-loop threads).
+
+        Returns:
+            True if healthy, False otherwise.
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
+            return False
+        # Drain *all* queued errors so that a fatal error queued behind
+        # a RequestError is not hidden until the next health check.
+        drained = False
+        while True:
+            try:
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                drained = True
+                if not isinstance(e, (str, RequestError)):
+                    self._set_fatal_error(e)
+                    self.shutdown()
+                    break  # No need to drain further after fatal
+            except Empty:
+                break
+        if drained:
+            return self._fatal_error is None and not self.doing_shutdown
+        return True
 
     @abstractmethod
     def shutdown(self):
         pass
+
+    @property
+    def resource_governor_queue(self):
+        """Return the resource governor queue if this executor supports it."""
+        return None
 
     @property
     def enable_postprocess_parallel(self) -> bool:
@@ -324,7 +411,7 @@ class GenerationExecutor(ABC):
         """
         if self._iter_stats_result is None:
             print_colored(
-                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats_async() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
+                "Iteration statistics are not available yet. To collect runtime statistics, please call aget_stats() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
                 "yellow")
             return empty_async_iterable()
 
@@ -356,6 +443,9 @@ class GenerationExecutor(ABC):
 
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
+
+    def get_disaggregated_params(self) -> dict:
+        return {}
 
     @staticmethod
     def _create_ray_executor(
@@ -531,8 +621,8 @@ class GenerationExecutor(ABC):
                 use_worker=True)
 
         # For single-gpu case:
-        # Partition the workload to multiple process for streaming performance.
-        # While this requires uses to protect their entrypoint to
+        # Partition the workload to multiple processes for streaming performance.
+        # While this requires users to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
             if orchestrator_is_rpc:

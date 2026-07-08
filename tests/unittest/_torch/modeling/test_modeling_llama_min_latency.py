@@ -298,6 +298,7 @@ class TestLlama4MinLatency(unittest.TestCase):
             weight_mapper.init_model_and_config(llama, model_config)
             llama.load_weights(hf_llama.state_dict(),
                                weight_mapper=weight_mapper)
+            llama.post_load_weights()
 
         num_blocks = 1
         tokens_per_block = 128

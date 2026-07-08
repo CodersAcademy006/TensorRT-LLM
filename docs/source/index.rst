@@ -14,6 +14,7 @@ Welcome to TensorRT LLM's Documentation!
    overview.md
    quick-start-guide.md
    installation/index.rst
+   supported-hardware.md
 
 
 .. toctree::
@@ -22,9 +23,11 @@ Welcome to TensorRT LLM's Documentation!
    :name: Deployment Guide
 
    examples/llm_api_examples.rst
+   examples/visual_gen_examples.rst
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
+   deployment-guide/configuring-cpu-affinity.md
 
 .. toctree::
    :maxdepth: 2
@@ -32,6 +35,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Models
 
    models/supported-models.md
+   models/visual-generation.md
    models/adding-new-model.md
 
 
@@ -75,10 +79,12 @@ Welcome to TensorRT LLM's Documentation!
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
+   features/auto_deploy/transforms.rst
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
    features/kv-cache-connector.md
+   features/sparse-attention.md
 
 
 .. toctree::
@@ -92,18 +98,22 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
+   developer-guide/telemetry.md
 
 
 .. toctree::
    :maxdepth: 2
    :caption: Blogs
    :glob:
+   :reversed:
 
-   blogs/tech_blog/*
-   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
-   blogs/H200launch.md
-   blogs/XQA-kernel.md
+   blogs/quantization-in-TRT-LLM.md
+   blogs/Falcon180B-H200.md
    blogs/H100vsA100.md
+   blogs/XQA-kernel.md
+   blogs/H200launch.md
+   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
+   blogs/tech_blog/*
 
 
 .. toctree::

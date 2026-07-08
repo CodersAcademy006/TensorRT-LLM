@@ -16,15 +16,18 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 constexpr size_t WARP_SIZE = 32;
@@ -77,6 +80,7 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+    RMS_NORM = 9,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -94,6 +98,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
     case AllReduceFusionOp::MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM:
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
+    case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;
@@ -192,4 +197,6 @@ namespace reduce_fusion
 bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

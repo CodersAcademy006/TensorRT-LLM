@@ -89,7 +89,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     auto const maxNbTokens = getMaxBeamNumTokens();
 
-    if (isDisaggContextTransmissionState() && isContextOnlyRequest())
+    if ((isDisaggContextTransmissionState() || isDisaggContextCompleteState()) && isContextOnlyRequest())
     {
         auto const reqBeamWidth = mSamplingConfig.beamWidth;
         std::vector<TokenIdType> firstGenTokens;
@@ -99,13 +99,15 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         }
         if (!hasDraftTokens())
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), std::nullopt};
+            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
+                mContextPhaseParams.value().releaseState(), std::nullopt, mContextPhaseParams.value().getCtxDpRank(),
+                mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
         else
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), *getDraftTokens()};
+            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
+                mContextPhaseParams.value().releaseState(), *getDraftTokens(),
+                mContextPhaseParams.value().getCtxDpRank(), mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
     }
 

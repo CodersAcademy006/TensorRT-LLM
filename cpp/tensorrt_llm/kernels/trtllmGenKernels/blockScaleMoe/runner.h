@@ -17,7 +17,8 @@
 #pragma once
 
 #include "DevKernel.h"
-#include "RoutingKernel.h"
+#include "routing/RoutingKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
@@ -26,8 +27,8 @@
 #include <set>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -75,10 +76,17 @@ enum class RoutingMethodType : int64_t
     DeepSeekV3 = 2,
     // Llama4: Top1 -> Sigmoid
     Llama4 = 3,
-    // RenormalizeNaive: Softmax -> TopK -> Renormalize
+    // RenormalizeNaive: Softmax -> TopK -> Renormalize.
+    // Mathematically equivalent to Renormalize (TopK -> Softmax), but conceptually applies
+    // softmax over all N experts first. At runtime, we use the Renormalize kernel path
+    // (TopK -> Softmax over K) which is faster since softmax is only over K selected experts.
     RenormalizeNaive = 4,
+    // MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
+    MiniMax2 = 5,
+    // SigmoidRenorm: Sigmoid -> TopK -> Renormalize
+    SigmoidRenorm = 6,
     // Unspecified
-    Unspecified = 5,
+    Unspecified = 7,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -97,45 +105,53 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
     case RoutingMethodType::Llama4: return "Llama4";
     case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
+    case RoutingMethodType::MiniMax2: return "MiniMax2";
+    case RoutingMethodType::SigmoidRenorm: return "SigmoidRenorm";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
 
-inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
+inline int32_t getMaxNumCgasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t cgaTileTokensDim)
 {
-    // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
-    // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine
-    // the actual number of CTAs to run.
+    // For MoE, mNumTokens != 0 and the number of CGAs is known only at runtime.
+    // We launch maximally possible number of CGAs and use ptrNumNonExitingCtas to determine
+    // the actual number of CGAs to run.
 
     // Initialize number of tokens with the number of expanded tokens after routing.
-    int32_t numRemainingTokens = numTokens * topK;
-    int32_t maxNumCtasInBatchDim = 0;
-    // First, distribute one token each expert until token depletion to maximize CTA tile count.
-    int32_t numExpertsFilled = std::min(numExperts, numRemainingTokens);
-    maxNumCtasInBatchDim += numExpertsFilled;
+    auto numRemainingTokens = numTokens * topK;
+    int32_t maxNumCgasInBatchDim = 0;
+    // First, distribute one token each expert until token depletion to maximize CGA tile count.
+    auto numExpertsFilled = std::min(numExperts, numRemainingTokens);
+    maxNumCgasInBatchDim += numExpertsFilled;
     numRemainingTokens -= numExpertsFilled;
-    // Next, greedily pour all remaining tokens to one expert to maximize CTA tile count.
+    // Next, greedily pour all remaining tokens to one expert to maximize CGA tile count.
     // E.g., at this point tokens over 4 experts are [1, 1, 1, 1], and we have 4 tokens left.
-    // If each CTA handles 4 tokens/expert, the greedy strategy is to pour all remaining tokens
-    // to any one expert to get to the 5th CTA tile. Otherwise, we can only get 4 tiles in total.
+    // If each CGA handles 4 tokens/expert, the greedy strategy is to pour all remaining tokens
+    // to any one expert to get to the 5th CGA tile. Otherwise, we can only get 4 tiles in total.
     //
     // Another way to reason about this is to pour the remaining tokens into buckets of some fixed
     // capacity. These buckets, if full, can then be attributed to any expert; it does not have to
     // belong to the same expert every time.
     if (numRemainingTokens > 0)
     {
-        // For every tileTokenDim tokens, we add an extra CTA tile in the token dimension.
-        // The number of CTA tiles is given by divDown(numRemainingTokens, tokenTileDim).
-        maxNumCtasInBatchDim += (numRemainingTokens / tileTokensDim);
+        // For every tileTokenDim tokens, we add an extra CGA tile in the token dimension.
+        // The number of CGA tiles is given by divDown(numRemainingTokens, tokenTileDim).
+        maxNumCgasInBatchDim += (numRemainingTokens / cgaTileTokensDim);
     }
-    return maxNumCtasInBatchDim;
+    return maxNumCgasInBatchDim;
+}
+
+// Backward-compatible alias — callers outside routing may still use the old name.
+inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
+{
+    return getMaxNumCgasInBatchDim(numTokens, topK, numExperts, tileTokensDim);
 }
 
 inline int32_t getMaxPermutedPaddedCount(
     int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
 {
-    int32_t maxCtas = getMaxNumCtasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
-    return maxCtas * padding;
+    int32_t maxCgas = getMaxNumCgasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
+    return maxCgas * padding;
 }
 
 class Runner
@@ -143,7 +159,7 @@ class Runner
 public:
     explicit Runner();
 
-    explicit Runner(int32_t tileTokensDim);
+    explicit Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim = 1);
 
     void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
         int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
@@ -152,7 +168,9 @@ public:
         int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert,
         int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
         batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-        RoutingMethodType routingMethodType, cudaStream_t stream);
+        RoutingMethodType routingMethodType, cudaStream_t stream,
+        batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16,
+        batchedGemm::trtllm::gen::Dtype dtypeRoutingBias = batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
 private:
     int32_t mTileTokensDim;
@@ -193,6 +211,7 @@ private:
     batchedGemm::trtllm::gen::Dtype mDtypeAct;
     batchedGemm::trtllm::gen::Dtype mDtypeWeights;
     int32_t mTileTokensDim;
+    ActType mActType;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
 } // namespace PermuteGemm1
@@ -243,7 +262,7 @@ struct MoERunnerArgs
 {
     void* routing_logits
         = nullptr; // [num_tokens, num_experts] in float, generated after gemm(hidden_state, routing_weights)
-    void* routing_bias = nullptr;  // [num_experts] in bfloat16 for now = mDtypeExpW
+    void* routing_bias = nullptr;  // [num_experts] in mDtypeBias (bfloat16 or float32)
     void* hidden_states = nullptr; // [num_tokens, hidden_size] in fp8 = mDtypeElt
     // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
     // and [num_tokens, hidden_size/16] in float for e2m1
@@ -284,6 +303,7 @@ struct MoERunnerArgs
     // TODO: support other types
     btg::Dtype mDtypeElt{btg::Dtype::Void};
     btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};
+    btg::Dtype mDtypeBias{btg::Dtype::Bfloat16};
     btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
     // Unpadded dimensions.
     std::optional<int32_t> valid_intermediate_size{std::nullopt};
@@ -328,7 +348,6 @@ struct MoEWorkspace
     float* permuted_hidden_states_scale = nullptr;
 
     // Gemm1 intermediate outputs:
-    int32_t ProjUpTileN{0};
     void* gemm1_output = nullptr;
     float* gemm1_output_scale = nullptr;
 
@@ -387,6 +406,7 @@ private:
 private:
     PermuteGemm1::Runner mPermuteGemm1;
     Gemm2::Runner mGemm2;
+    ActType mActType;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately
@@ -396,4 +416,5 @@ private:
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

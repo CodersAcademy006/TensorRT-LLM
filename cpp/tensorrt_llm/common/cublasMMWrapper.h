@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -24,8 +25,8 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -91,12 +92,12 @@ public:
     // Uses default/heuristic algorithm
     void BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
-        void const* b_sf, float const* alpha);
+        void const* b_sf, float const* alpha, void const* bias = nullptr);
 
-    // Uses specified algorithm (for autotuning)
+    // Uses specified algorithm (for autotuning). Optional `bias` fused via CUBLASLT_EPILOGUE_BIAS.
     void BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
-        void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo);
+        void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo, void const* bias = nullptr);
 #endif
 
     void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
@@ -185,4 +186,4 @@ public:
 
 } // namespace common
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

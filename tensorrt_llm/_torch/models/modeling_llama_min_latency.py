@@ -88,9 +88,10 @@ class Llama4MinLatencyLinear(Linear):
         self.enable_trtllm_gen = enable_trtllm_gen
         self.position_ids = None
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool):
 
-        super().load_weights(weights)
+        super().load_weights(weights,
+                             allow_partial_loading=allow_partial_loading)
 
         # After loading weights, calculate the combined scale (input_scale * weight_scale) for special kernels and
         # trtllm-gen kernels.
@@ -384,11 +385,6 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 and self.floor_scale == 8192.0 \
                 and self.attn_scale == 0.1
 
-            qkv_shard_indices_mapping = {
-                "q": (0, self.q_size),
-                "k": (self.q_size, self.kv_size),
-                "v": (self.q_size + self.kv_size, self.kv_size),
-            }
             # When min-latency QKV gemm is enabled, override qkv_proj.
             self.qkv_proj = Llama4MinLatencyLinear(
                 self.hidden_size,
@@ -405,7 +401,6 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 enable_fused_gemm_attn_scaling=self.
                 enable_fused_gemm_attn_scaling,
                 enable_trtllm_gen=True,
-                fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             )
 
     def _forward_nope(
@@ -617,15 +612,29 @@ class Llama4MinLatencyMoE(Llama4MoE):
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, hidden_states_high)
         shared_output, routed_output = maybe_execute_in_parallel(
-            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
+            fn0,
+            fn1,
+            self.moe_event[0],
+            self.moe_event[1],
+            self.aux_stream,
+            disable_on_compile=True)
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            if isinstance(shared_output, torch.Tensor):
+                output_tensor, _ = torch.ops.trtllm.allocate_output(
+                    shared_output, self.all_reduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=output_tensor)
+            else:
+                final_hidden_states = shared_output + routed_output
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states
 
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,8 @@ class BaseKVCacheManager;
 
 namespace tensorrt_llm::executor
 {
+
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
@@ -295,11 +297,19 @@ class MultimodalInput
 {
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+    [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalItemRunCuOffsets() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunPositions() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunLengths() const;
 
 private:
     friend class Serialization;
@@ -309,6 +319,15 @@ private:
     std::vector<SizeType32> mMultimodalPositions;
     /// @brief The multimodal lengths
     std::vector<SizeType32> mMultimodalLengths;
+    /// @brief Optional user-provided UUIDs for multimodal items.
+    /// When provided, these are returned in KV cache events instead of content hashes.
+    std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
+    /// @brief Optional offsets indexing the flat exact multimodal run arrays per item.
+    std::optional<std::vector<SizeType32>> mMultimodalItemRunCuOffsets;
+    /// @brief Optional prompt start positions for flat exact multimodal token runs.
+    std::optional<std::vector<SizeType32>> mMultimodalRunPositions;
+    /// @brief Optional lengths for flat exact multimodal token runs.
+    std::optional<std::vector<SizeType32>> mMultimodalRunLengths;
 };
 
 /// @brief Configuration for mrope
@@ -436,11 +455,15 @@ class ContextPhaseParams
 public:
     using RequestIdType = std::uint64_t;
 
-    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens);
-    ContextPhaseParams(
-        VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens,
+        std::optional<SizeType32> ctxDpRank = std::nullopt,
+        std::optional<std::string> disaggInfoEndpoint = std::nullopt);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens,
+        std::optional<SizeType32> ctxDpRank = std::nullopt,
+        std::optional<std::string> disaggInfoEndpoint = std::nullopt);
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::vector<char> const& serializedState,
-        std::optional<VecTokens> draftTokens);
+        std::optional<VecTokens> draftTokens, std::optional<SizeType32> ctxDpRank = std::nullopt,
+        std::optional<std::string> disaggInfoEndpoint = std::nullopt);
 
     ContextPhaseParams(ContextPhaseParams const&);
     ContextPhaseParams(ContextPhaseParams&&) noexcept;
@@ -451,14 +474,21 @@ public:
     [[nodiscard]] bool operator==(ContextPhaseParams const&) const noexcept;
 
     [[nodiscard]] VecTokens const& getFirstGenTokens() const& noexcept;
+    void setFirstGenTokens(VecTokens const& firstGenTokens) noexcept;
     [[nodiscard]] std::optional<VecTokens> const& getDraftTokens() const& noexcept;
+    void setDraftTokens(std::optional<VecTokens> const& draftTokens) noexcept;
     [[nodiscard]] VecTokens popFirstGenTokens() && noexcept;
     [[nodiscard]] RequestIdType getReqId() const noexcept;
-
+    void setReqId(RequestIdType const& reqId) noexcept;
     [[nodiscard]] void const* getState() const noexcept;
     [[nodiscard]] void* getState() noexcept;
     [[nodiscard]] void* releaseState() noexcept;
     [[nodiscard]] std::vector<char> getSerializedState() const noexcept;
+
+    [[nodiscard]] std::optional<SizeType32> getCtxDpRank() const noexcept;
+    void setCtxDpRank(std::optional<SizeType32> const& ctxDpRank) noexcept;
+    [[nodiscard]] std::optional<std::string> const& getDisaggInfoEndpoint() const noexcept;
+    void setDisaggInfoEndpoint(std::optional<std::string> const& disaggInfoEndpoint) noexcept;
 
 private:
     friend class Serialization;
@@ -476,6 +506,12 @@ private:
 
     /// @brief The draft tokens generated by context executor
     std::optional<VecTokens> mDraftTokens;
+
+    /// @brief The context phase data parallel rank
+    std::optional<SizeType32> mCtxDpRank;
+
+    /// @brief The disaggregated info endpoint
+    std::optional<std::string> mDisaggInfoEndpoint;
 };
 
 /// @brief Configuration for speculative decoding (both draft and target models)
@@ -647,7 +683,8 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
-    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
+    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
+    /// exact prompt runs}
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
@@ -677,7 +714,9 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
+    /// @param disaggRequestId Disaggregated request ID.
+    /// @param cacheSalt Optional cache salt string. If provided, KV cache blocks are tagged so reuse is limited to
+    /// requests with the same salt. The string is also surfaced in KV cache events. Defaults to std::nullopt.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -705,7 +744,7 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt);
+        std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -753,8 +792,9 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
-    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -789,7 +829,8 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-    void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setCacheSalt(std::optional<std::string> cacheSalt);
+    void setDisaggRequestId(IdType disaggRequestId);
 
 private:
     friend class Serialization;
@@ -1011,7 +1052,7 @@ public:
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
-        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
+        std::optional<size_t> const& hostCacheSize = std::nullopt,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
@@ -1028,7 +1069,6 @@ public:
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
     [[nodiscard]] std::optional<FloatType> getCrossKvCacheFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
-    [[nodiscard]] bool getOnboardBlocks() const;
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
@@ -1044,7 +1084,6 @@ public:
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
     void setCrossKvCacheFraction(FloatType crossKvCacheFraction);
     void setHostCacheSize(size_t hostCacheSize);
-    void setOnboardBlocks(bool onboardBlocks);
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
@@ -1087,9 +1126,6 @@ private:
     /// @brief Size of secondary memory pool in bytes. Default is 0.
     /// Having a secondary memory pool increases KV cache block reuse potential.
     std::optional<size_t> mHostCacheSize;
-
-    /// @brief Controls whether offloaded blocks should be onboarded back into primary memory before being reused.
-    bool mOnboardBlocks;
 
     /// @brief Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory.
     std::optional<RetentionPriority> mSecondaryOffloadMinPriority;
@@ -1462,7 +1498,8 @@ public:
         DEFAULT = 0,
         MPI = 1,
         UCX = 2,
-        NIXL = 3
+        NIXL = 3,
+        MOONCAKE = 4
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
@@ -1504,7 +1541,7 @@ public:
     static constexpr SizeType32 kDefaultRequestStatsMaxIterations = 0;
 
     explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
-        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = true,
+        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = false,
         SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
@@ -1691,12 +1728,15 @@ struct KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
-        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority)
+        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
+        std::vector<MmKey> mmKeys = {}, std::optional<std::string> cacheSalt = std::nullopt)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
+        , mmKeys{std::move(mmKeys)}
+        , cacheSalt{std::move(cacheSalt)}
     {
     }
 
@@ -1710,6 +1750,10 @@ struct KVCacheStoredBlockData
     SizeType32 cacheLevel;
     /// @brief The priority of the block
     SizeType32 priority;
+    /// @brief The multimodal keys of the block
+    std::vector<MmKey> mmKeys;
+    /// @brief The original cache salt string of the block, if any
+    std::optional<std::string> cacheSalt;
 };
 
 struct KVCacheStoredData

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 import asyncio
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
@@ -99,16 +99,24 @@ class OpenAIHttpClient(OpenAIClient):
         max_retries: int = 1,
         retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
+        disagg_id_generator: Optional[Callable[[], int]] = None,
     ):
         self._router = router
         self._role = role
         self._metrics_collector = ClientMetricsCollector(role)
         self._session = session or aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=False),
+            connector=aiohttp.TCPConnector(
+                limit=0,
+                limit_per_host=0,
+                force_close=False,
+                # Set keepalive_timeout below the server-side keepalive timeout to avoid reusing stale connections.
+                keepalive_timeout=1,
+            ),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
         )
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
+        self._disagg_id_generator = disagg_id_generator
 
     async def _send_request(
         self,
@@ -155,10 +163,16 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
     ) -> AsyncGenerator[Any, None]:
-        json_data = request.model_dump(exclude_unset=True)
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
+            # Regenerate disagg_request_id on retry to avoid ID collision on workers
+            if attempt > 0 and self._disagg_id_generator is not None:
+                dp = getattr(request, "disaggregated_params", None)
+                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                    dp.disagg_request_id = self._disagg_id_generator()
+            json_data = request.model_dump(exclude_unset=True, mode="json")
             try:
+                lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(url, json=json_data) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
@@ -172,17 +186,35 @@ class OpenAIHttpClient(OpenAIClient):
                         async for line in self._response_generator(
                             request, http_response, start_time, server, hooks
                         ):
+                            lines_yielded += 1
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
-                        http_response.raise_for_status()
+                        if http_response.status >= 400:
+                            error_body = await http_response.text()
+                            raise aiohttp.ClientResponseError(
+                                http_response.request_info,
+                                http_response.history,
+                                status=http_response.status,
+                                message=f"{http_response.reason}: {error_body[:2048]}",
+                                headers=http_response.headers,
+                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
                         # finish the request after the successful response
                         await self._finish_request(request)
+                        self._metrics_collector.complete_latency_seconds.observe(
+                            get_steady_clock_now_in_seconds() - start_time
+                        )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if lines_yielded > 0:
+                    logger.error(
+                        f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
+                        traceback.format_exc(),
+                    )
+                    raise
                 if attempt == self._max_retries:
                     logger.error(
                         f"Client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
@@ -219,25 +251,24 @@ class OpenAIHttpClient(OpenAIClient):
             i = 0
             async for line in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if i == 0:
-                    if hooks:
-                        hooks.on_first_token(server, request)
-                    self._metrics_collector.first_token_latency_seconds.observe(
-                        now_time - last_token_time
-                    )
-                else:
-                    self._metrics_collector.per_token_latency_seconds.observe(
-                        now_time - last_token_time
-                    )
-                i += 1
                 if line:
+                    if i == 0:
+                        if hooks:
+                            hooks.on_first_token(server, request)
+                        self._metrics_collector.first_token_latency_seconds.observe(
+                            now_time - last_token_time
+                        )
+                    else:
+                        self._metrics_collector.per_token_latency_seconds.observe(
+                            now_time - last_token_time
+                        )
+                    i += 1
                     yield line
                     await asyncio.sleep(0)
                 last_token_time = now_time
 
             if hooks:
                 hooks.on_resp_done(server, request, None)
-            self._metrics_collector.completed_requests.inc()
             self._metrics_collector.complete_latency_seconds.observe(
                 get_steady_clock_now_in_seconds() - start_time
             )
@@ -254,6 +285,7 @@ class OpenAIHttpClient(OpenAIClient):
             await self._finish_request(request)
 
     async def _finish_request(self, request: UCompletionRequest) -> None:
+        self._metrics_collector.completed_requests.inc()
         await self._router.finish_request(request)
 
     async def collect_metrics(self) -> Dict[str, Any]:
@@ -271,7 +303,12 @@ class OpenAIHttpClient(OpenAIClient):
         await self._session.close()
 
     async def check_ready(self) -> Tuple[List[str], List[str]]:
-        return await OpenAIHttpClient.check_ready_for_servers(self._session, self._router.servers)
+        ready_servers, unready_servers = await OpenAIHttpClient.check_ready_for_servers(
+            self._session, self._router.servers
+        )
+        if ready_servers:
+            await self._router.prepare_servers(ready_servers)
+        return ready_servers, unready_servers
 
     @staticmethod
     async def check_ready_for_servers(

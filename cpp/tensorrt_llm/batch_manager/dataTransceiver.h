@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -81,10 +82,11 @@ public:
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
+        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
+        , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
@@ -139,8 +141,19 @@ public:
         return mLastBlockKey;
     }
 
+    [[nodiscard]] std::vector<SizeType32> const& getCounterPartRanks() const
+    {
+        return mCounterPartRanks;
+    }
+
+    void setCounterPartRanks(std::vector<SizeType32> ranks)
+    {
+        mCounterPartRanks = std::move(ranks);
+    }
+
 private:
     std::vector<Connection const*> mConnections;
+    std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;
@@ -235,16 +248,18 @@ class CacheSender
 {
 public:
     /// @brief Constructor.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheSender() = default;
 
     /// @brief Asynchronously respond to the request and send data.
-    /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization.
+    /// @param llmRequest Request object. Its data should be ready when called. shared_ptr so the async send
+    /// worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -272,6 +287,12 @@ public:
     /// @param isReady Whether the request is ready to be received.
     virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
 
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -290,16 +311,18 @@ class CacheReceiver
 {
 public:
     /// @brief Constructor.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheReceiver() = default;
 
     /// @brief Asynchronously send a request to receive data.
-    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
+    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called.
+    /// shared_ptr so the async receive worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
@@ -314,6 +337,12 @@ public:
     /// @param session The session object.
     /// @return Whether the request is ready to be received.
     virtual bool receiveReadySignal(TransferSession& session);
+
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
 
     /// @brief Destructor.
     virtual ~CacheReceiver();
