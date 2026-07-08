@@ -26,26 +26,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-comment:
-    name: Check for /run-ci-mirror comment
-    if: github.event_name == 'issue_comment'
-    runs-on: ubuntu-latest
-    outputs:
-      trigger: ${{ steps.check.outputs.trigger }}
-    steps:
-      - id: check
-        run: |
-          if [[ "${{ contains(github.event.comment.body, '/run-ci-mirror') }}" == "true" ]] && [[ "${{ github.event.issue.pull_request }}" != "" ]]; then
-            echo "trigger=true" >> $GITHUB_OUTPUT
-          fi
-
   precommit-check:
     name: Pre-commit Check
-    needs: [check-comment]
     if: |
       github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch') ||
-      (github.event_name == 'issue_comment' && needs.check-comment.outputs.trigger == 'true')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/run-ci-mirror'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
